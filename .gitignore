@@ -13,3 +13,7 @@ Server/hdl_jobs.json
 *.log
 *.log
 *.log
+/
+*.pyc
+/Server/__pycache__
+Server/server.log
