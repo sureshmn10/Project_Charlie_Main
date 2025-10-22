@@ -2772,6 +2772,24 @@ async def validate_data(payload: ValidatePayload):
 
         logger.info("Finished key values uniqueness validation.")
 
+        # if Compoent name is ExternalIdentifier check for the DateFrom column for timestamp and only allow if timestamp exists "yyyy/mm/dd hh:mm:ss"
+        if component_name.strip().lower() == "externalidentifier":
+            logger.info("Starting ExternalIdentifier DateFrom timestamp validation...")
+            if "DateFrom" in df.columns:
+                for idx, val in df["DateFrom"].items():
+                    if val == "" or pd.isna(val):
+                        continue  # Empty values handled by required field validation
+                    try:
+                        parsed_date = pd.to_datetime(val, errors='raise')
+                        if parsed_date.time() == pd.Timestamp(0).time():
+                            reason = f"DateFrom '{val}' must include a timestamp (HH:MM:SS)"
+                            existing_reason = df.at[idx, "Reason for Failed"]
+                            df.at[idx, "Reason for Failed"] = f"{existing_reason}; {reason}" if existing_reason else reason
+                    except Exception:
+                        reason = f"DateFrom '{val}' is not a valid datetime format"
+                        existing_reason = df.at[idx, "Reason for Failed"]
+                        df.at[idx, "Reason for Failed"] = f"{existing_reason}; {reason}" if existing_reason else reason
+            logger.info("Completed ExternalIdentifier DateFrom timestamp validation.")
 
         # --- VALIDATE START DATE BEFORE END DATE ---
         logger.info("Starting EffectiveStartDate < EffectiveEndDate validation...")
