@@ -2,7 +2,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/React-18.0-blue?style=for-the-badge&logo=react" />
   <img src="https://img.shields.io/badge/Python-3.10-green?style=for-the-badge&logo=python" />
-  <img src="https://img.shields.io/badge/Flask-2.3-black?style=for-the-badge&logo=flask" />
+  <img src="https://img.shields.io/badge/FastAPI-2.3-black?style=for-the-badge&logo=fastapi" />
   <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" />
 </p>
 
