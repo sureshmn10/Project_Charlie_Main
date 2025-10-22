@@ -1494,6 +1494,7 @@ useEffect(() => {
   }, [selectedItem, isComponentSelected, datFile, handleDatFileUpload, showSnackbar]);
 
 
+
   // Auto-populate Excel file based on selected component
   useEffect(() => {
     if (selectedItem) {

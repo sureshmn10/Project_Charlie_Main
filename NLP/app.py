@@ -162,6 +162,7 @@ def generate_validation_code(validation_rules, existing_code_with_error=None): #
         "- Do not add example usage, print statements, or global code — only the function definition.",
         "",
         "### Critical Rule:",
+        "- 'nan' is also considered a missing value or empty value where applicable.",
         "- All validation logic must strictly adhere to the rules provided above.",
         "- They must not deviate, generalize, or infer additional rules beyond what is explicitly stated.",
         "- If the Year is mentioned in the rule, ensure to validate it correctly.",
