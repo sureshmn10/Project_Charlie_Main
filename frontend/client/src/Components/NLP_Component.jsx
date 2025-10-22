@@ -42,7 +42,7 @@ const ChatBotComponent = ({ attribute, allattributes, open, onClose, componentNa
   const [previewOpen, setPreviewOpen] = useState(false);
   const [csvFile, setCsvFile] = useState(excelFile || null); // State for uploaded CSV/Excel file
   const [csvHeaders, setCsvHeaders] = useState([]);
-  const [selectedAttribute, setSelectedAttribute] = useState(""); // State for the primary attribute for validation
+  // primary attribute removed — rules will be applied as generic rules
   const [validationResult, setValidationResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -221,29 +221,11 @@ const ChatBotComponent = ({ attribute, allattributes, open, onClose, componentNa
     }
   }, []);
 
-  useEffect(() => {
-  if (selectedAttribute) {
-    gsap.fromTo(
-      '.primary-attr-chip',
-      { opacity: 0, scale: 0.8, y: -6 },
-      { opacity: 1, scale: 1, y: 0, duration: 0.4, ease: 'back.out(1.7)' }
-    );
-  }
-}, [selectedAttribute]);
+  // Primary attribute feature removed: chips will still animate when popover opens but
+  // there is no dedicated "primary" attribute state.
 
 
-  // Set selectedAttribute based on component's attribute prop or first CSV header
-  useEffect(() => {
-    if (csvHeaders.length > 0) {
-      if (attribute && csvHeaders.includes(attribute)) {
-        setSelectedAttribute(attribute);
-      } else {
-        setSelectedAttribute(csvHeaders[0] || "");
-      }
-    } else {
-      setSelectedAttribute("");
-    }
-  }, [attribute, csvHeaders]);
+
 
   // Fetch initial NLRs from backend when attribute prop changes
   useEffect(() => {
@@ -276,7 +258,7 @@ const ChatBotComponent = ({ attribute, allattributes, open, onClose, componentNa
       const res = await axios.post(`${EndpointBackPoint}/api/hdl/save_code`, {
       code: pythonCode,
       component_name: componentName || "default_component",
-      attribute: selectedAttribute,
+  // attribute field removed; backend will consume rules as generic validations
       rules: [nlr],
       conditions: [], // or any conditions you want
       customerName: customerName, // example placeholder
@@ -427,21 +409,12 @@ const handleExcelChange = (e) => {
       let headers = lines[0].split(",").map(h => h.trim());
 
       // Construct validation rules payload for the backend
-      const validationRulesForBackend = {
-          validations: [
-              rules.reduce((acc, rule) => {
-                  if (selectedAttribute && rule.trim()) { // Apply rules to the selected attribute if one is chosen
-                      acc[selectedAttribute] = (acc[selectedAttribute] ? acc[selectedAttribute] + " and " : "") + rule;
-                  }
-                  return acc;
-              }, {})
-          ]
-      };
-
-      // If no specific attribute is selected but rules exist, apply them as generic rules
-      if (Object.keys(validationRulesForBackend.validations[0]).length === 0 && rules.length > 0) {
-          validationRulesForBackend.validations[0]['_generic_rules'] = rules.join(" and ");
-      }
+    // Always use generic rules (no primary attribute)
+    const validationRulesForBackend = {
+      validations: [
+        { _generic_rules: rules.join(" and ") }
+      ]
+    };
 
       const validationFileContent = JSON.stringify(validationRulesForBackend, null, 2);
       const validationFileBlob = new Blob([validationFileContent], { type: 'application/json' });
@@ -689,82 +662,44 @@ const handleAttributeInsert = (attributeName) => {
             </Box>
           </Box>
             {/* Left Column: Rules - now takes full width */}
-<Box sx={{ flex: 1, maxHeight: 280, overflowY: 'auto' }}>
-  <Box
-    sx={{
-      p: 2.5,
-      borderRadius: 4,
-      background: (theme) => (theme.palette.mode === 'dark' ? theme.palette.background.paper : 'linear-gradient(145deg, #ffffff 0%, #f6f8ff 100%)'),
-      border: (theme) => `1px solid ${theme.palette.divider}`,
-      boxShadow: '0 8px 20px rgba(81, 45, 168, 0.08)',
-      display: 'flex',
-      flexDirection: 'row', // CHANGED: from 'column' to 'row'
-      alignItems: 'center', // ADDED: to vertically center the items
-      gap: 2,
-      transition: 'all 0.3s ease',
-      '&:hover': {
-        transform: 'translateY(-2px)',
-        boxShadow: '0 12px 28px rgba(81,45,168,0.15)',
-      },
-    }}
-  >
-    {/* ADDED: Wrapper to allow RulePaper to grow */}
-    <Box sx={{ flexGrow: 1, minWidth: 0 }}>
-      <RulePaper
-        nlr={nlr}
-        idx={0}
-        onNlrChange={(_, value) => setNlr(value)}
-        onRemoveNlr={null}
-        csvHeaders={csvHeaders}
-        onOpenAttributePopover={(e) => handleOpenAttributePopover(e, 0)}
-        ruleAnimation={ruleAnimation}
-        rulePaperAnimations={rulePaperAnimations}
-      />
-    </Box>
-
-    {selectedAttribute ? (
-      <Chip
-        className="primary-attr-chip"
-        icon={<VpnKeyOutlinedIcon sx={{ fontSize: '18px' }} />}
-        label={selectedAttribute}
-        color="primary"
-        variant="outlined"
-        clickable
-        onClick={(e) => handleOpenAttributePopover(e, 0)}
-        sx={{
-          textTransform: 'capitalize',
-          fontWeight: 500,
-          letterSpacing: '0.5px',
-          cursor: 'pointer',
-          py: 2,
-          px: 1,
-          transition: 'background-color 0.25s ease-out',
-          '&:hover': {
-            backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
-          },
-          // REMOVED: alignSelf is not needed in a row layout with alignItems
-          '.MuiChip-icon': {
-            color: 'primary.main',
-          },
-        }}
-      />
-    ) : (
-      <Alert
-        severity="warning"
-        variant="outlined"
-        icon={<WarningAmberOutlinedIcon fontSize="inherit" />}
-        sx={{
-          borderStyle: 'dashed',
-          borderColor: 'warning.light',
-          backgroundColor: (theme) => alpha(theme.palette.warning.light, 0.1),
-          whiteSpace: 'nowrap', // ADDED: Prevents text from wrapping in tight spaces
-        }}
-      >
-        No primary attribute selected.
-      </Alert>
-    )}
-  </Box>
-</Box>
+        <Box sx={{ flex: 1, maxHeight: 280, overflowY: 'auto' }}>
+          <Box
+            sx={{
+              p: 2.5,
+              borderRadius: 4,
+              background: (theme) => (theme.palette.mode === 'dark' ? theme.palette.background.paper : 'linear-gradient(145deg, #ffffff 0%, #f6f8ff 100%)'),
+              border: (theme) => `1px solid ${theme.palette.divider}`,
+              boxShadow: '0 8px 20px rgba(81, 45, 168, 0.08)',
+              display: 'flex',
+              flexDirection: 'row', // CHANGED: from 'column' to 'row'
+              alignItems: 'center', // ADDED: to vertically center the items
+              
+              gap: 2,
+              transition: 'all 0.3s ease',
+              '&:hover': {
+                transform: 'translateY(-2px)',
+                boxShadow: '0 12px 28px rgba(81,45,168,0.15)',
+              },
+            }}
+          >
+            {/* ADDED: Wrapper to allow RulePaper to grow */}
+            <Box sx={{ flexGrow: 1, minWidth: 0 }}>
+              <Typography variant="subtitle1" fontWeight={600} mb={1}>
+                Define Your Rule:
+              </Typography>
+              <RulePaper
+                nlr={nlr}
+                idx={0}
+                onNlrChange={(_, value) => setNlr(value)}
+                onRemoveNlr={null}
+                csvHeaders={csvHeaders}
+                onOpenAttributePopover={(e) => handleOpenAttributePopover(e, 0)}
+                ruleAnimation={ruleAnimation}
+                rulePaperAnimations={rulePaperAnimations}
+              />
+            </Box>
+          </Box>
+        </Box>
         </DialogContent>
         <Box display="flex" justifyContent="space-between" alignItems="center" gap={2} p={2} bgcolor="#f7fafd">
           <Button
@@ -940,38 +875,6 @@ const handleAttributeInsert = (attributeName) => {
       >
         {csvHeaders.length > 0 ? (
           <>
-            {/* Section for selecting the primary attribute for validation */}
-            <Box>
-              <Typography variant="subtitle2" color="text.secondary" mb={1} sx={{ fontWeight: 600 }}>
-                Select Primary Validation Attribute:
-              </Typography>
-              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
-                {csvHeaders.map((header) => (
-                  <Chip
-                    key={`select-${header}`} // Unique key
-                    label={header}
-                    onClick={() => {
-                      setSelectedAttribute(header); // Set the primary attribute
-                      setAttributePopoverAnchorEl(null); // Close popover after selection
-                      setFocusedNlrIndex(null);
-                      setSnackbarMsg(`Primary validation attribute set to: ${header}`);
-                      setSnackbarSeverity("info");
-                      setSnackbarOpen(true);
-                    }}
-                    color="secondary" // Different color for distinction
-                    variant={selectedAttribute === header ? "filled" : "outlined"}
-                    sx={{ 
-                      cursor: 'pointer',
-                      '&:hover': {
-                          transform: 'scale(1.05)',
-                          boxShadow: 3,
-                      },
-                      transition: 'all 0.2s ease-in-out'
-                    }}
-                  />
-                ))}
-              </Box>
-            </Box>
             {/* Section for inserting attributes into the current rule */}
             <Box>
               <Typography variant="subtitle2" color="text.secondary" mb={1} sx={{ fontWeight: 600 }}>

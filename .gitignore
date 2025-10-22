@@ -17,3 +17,4 @@ Server/hdl_jobs.json
 *.pyc
 /Server/__pycache__
 Server/server.log
+Server/.env

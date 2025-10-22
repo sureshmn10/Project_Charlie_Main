@@ -54,8 +54,6 @@ import DescriptionIcon from "@mui/icons-material/Description";
 import CloudUploadIcon from "@mui/icons-material/CloudUpload";
 import VisibilityIcon from "@mui/icons-material/Visibility";
 import CloudDownloadIcon from "@mui/icons-material/CloudDownload";
-
-import OracleValueCheck from '../Components/Oracle_Value_check';
 gsap.registerPlugin(ScrollTrigger);
 
 const drawerWidth = 25;
@@ -239,7 +237,6 @@ const HDL = ({
   const steps = [
     "Select Source Keys",
     "Transform Customer Excel",
-    "Oracle Value Check",
     "Define NLP Rules",
     "Validate Data",
   ];
@@ -1722,45 +1719,7 @@ useEffect(() => {
           </Box>
         );
       
-      case 2: // Oracle Value Check step
-        return (
-          <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 2, width: '100%' }}>
-            <Typography variant="body1">
-              Oracle Value Checking and validation against Oracle system. This step is optional but recommended.
-            </Typography>
-            <Button
-              variant="contained"
-              color="primary"
-              onClick={handleOpenOracleDialog}
-              sx={{ alignSelf: 'center' }} 
-              disabled={!isComponentSelected}
-            >
-              Start Oracle Value Check
-            </Button>
-            {oracleValidationPassed && (
-              <Typography color="success.main" sx={{alignSelf: 'center' }}>
-                ✓ Oracle validation completed successfully
-              </Typography>
-            )}
-            <Box sx={{ display: 'flex', flexDirection: 'row', pt: 2, justifyContent: 'space-between', width: '100%' }}>
-              <Button
-                onClick={handleBack}
-                sx={{ mr: 1 }}
-              >
-                Back
-              </Button>
-              <Button
-                variant="contained"
-                onClick={handleNext}
-              >
-                Next
-              </Button>
-            </Box>
-          </Box>
-        );
-        
-
-      case 3: 
+      case 2: 
         return (
           <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 2, width: '100%' }}>
             <Typography variant="body1">Utilize NLP to define rules for data processing. This step is optional.</Typography>
@@ -1795,7 +1754,8 @@ useEffect(() => {
             </Box>
           </Box>
         );
-      case 4: // Validate Data
+
+      case 3: 
         return (
           <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 2, width: '100%' }}>
             <Typography variant="body1">Perform final data validation and review results.</Typography>
@@ -1823,6 +1783,7 @@ useEffect(() => {
             </Box>
           </Box>
         );
+
       default:
         return <Typography>Unknown step</Typography>;
     }
@@ -2443,28 +2404,7 @@ useEffect(() => {
           onPythonFileNameChange={setPythonFileName} // Pass the setter function as a callback
           PaperProps={{ className: 'MuiDialog-container-2' }}
         />
-      )}
-
-      {oracleDialogOpen && (
-        <OracleValueCheck
-          customerName={customerName}
-          instanceName={InstanceName}
-          componentName={componentName}
-          open={oracleDialogOpen}
-          setOracleValidationSets={setOracleValidationSets} // 👈 updated prop name
-          onClose={handleCloseOracleDialog}
-          onValidationComplete={(success) => {
-            console.log("Oracle validation completed with status:", success);
-            console.log("Oracle validation sets:", oracleValidationsets); // Log the sets for debugging
-            setOracleValidationPassed(success);
-            if (success) {
-              showSnackbar("Oracle validation completed successfully", "success");
-            }
-          }}
-        />
-
-          )}
-          
+      )}          
 
       <Snackbar
         open={snackbarOpen}

@@ -162,6 +162,12 @@ def generate_validation_code(validation_rules, existing_code_with_error=None): #
         "- Do not add example usage, print statements, or global code — only the function definition.",
         "",
         "### Critical Rule:",
+        "- All validation logic must strictly adhere to the rules provided above.",
+        "- They must not deviate, generalize, or infer additional rules beyond what is explicitly stated.",
+        "- If the Year is mentioned in the rule, ensure to validate it correctly.",
+        "- If the rule mentions specific values (like 'USA', 'Canada'), ensure to check for those exact values (case-insensitive).",
+        "- These rules are more related to Oracle DB data types and formats.",
+        "- The year can include this value '4712' which is valid in Oracle but uncommon elsewhere.",
         "- Only generate logic for columns explicitly mentioned in the 'Validation Rules' above.",
         "- Do not create inferred or generic validations (like string lengths or numeric checks) unless they are explicitly listed."
     ]
