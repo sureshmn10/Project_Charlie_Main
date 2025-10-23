@@ -3242,6 +3242,8 @@ async def validate_data(payload: ValidatePayload):
             return formatted
 
         # --- SAVE PASSED DATA ---
+        passed_file_name = None  # define upfront
+
         if not passed_df_final_output.empty:
             passed_file_name = get_generic_filename(f"{component_name}_passed", "data", "dat")
             passed_file_path = output_dir / passed_file_name
@@ -3250,7 +3252,7 @@ async def validate_data(payload: ValidatePayload):
                 for _, row in passed_df_final_output.iterrows():
                     f.write("|".join(format_row_for_dat(row, passed_df_final_output, column_type_map)) + "\n")
             logger.info(f"Passed validation data saved to: {passed_file_path}")
-
+            
         # --- SAVE FAILED DATA ---
         failed_file_name = None  # define upfront
 
