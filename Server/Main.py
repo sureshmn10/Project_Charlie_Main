@@ -3198,72 +3198,85 @@ async def validate_data(payload: ValidatePayload):
             return formatted
 
 
-        # --- GENERATE .DAT FILE FOR PASSED DATA ---
-        passed_file_name = None
-        failed_file_name = None
-        special_counter = 0  # Ensure special_counter is always defined
-        if not passed_df_final_output.empty: # Use the filtered DF for output
-            
+        # --- ENFORCE DATATYPES FROM PAYLOAD ---
+        logger.info("Enforcing datatypes based on payload attributes...")
+        # Create a dict mapping column -> expected type from payload
+        column_type_map = {attr.Attributes: attr.data_type for attr in attributes_to_validate}
+
+        def enforce_payload_dtypes(df_to_cast, column_type_map):
+            for col, dtype in column_type_map.items():
+                if col not in df_to_cast.columns:
+                    continue
+                try:
+                    if dtype.lower() in ["date", "datetime", "timestamp"]:
+                        df_to_cast[col] = pd.to_datetime(df_to_cast[col], errors="coerce")
+                    elif dtype.lower() in ["int", "integer"]:
+                        df_to_cast[col] = pd.to_numeric(df_to_cast[col], errors="coerce").fillna(0).astype(int)
+                    elif dtype.lower() in ["float", "double", "decimal"]:
+                        df_to_cast[col] = pd.to_numeric(df_to_cast[col], errors="coerce")
+                    else:
+                        df_to_cast[col] = df_to_cast[col].astype(str)
+                except Exception as e:
+                    logger.warning(f"Failed to cast column {col} to {dtype}: {e}")
+            return df_to_cast
+
+        passed_df_final_output = enforce_payload_dtypes(passed_df_final_output, column_type_map)
+        failed_df = enforce_payload_dtypes(failed_df, column_type_map)
+        logger.info("Datatype enforcement from payload completed.")
+
+        # --- FORMAT ROWS FOR DAT FILE ---
+        def format_row_for_dat(row, df, column_type_map):
+            formatted = []
+            for col, val in row.items():
+                dtype = column_type_map.get(col, None)
+                if dtype and dtype.lower() in ["date", "datetime", "timestamp"]:
+                    if pd.isna(val):
+                        formatted.append('')
+                    else:
+                        if dtype.lower() == "date":
+                            formatted.append(val.strftime('%Y/%m/%d'))
+                        else:  # datetime or timestamp
+                            formatted.append(val.strftime('%Y/%m/%d %H:%M:%S'))
+                else:
+                    formatted.append(str(val) if val is not None else '')
+            return formatted
+
+        # --- SAVE PASSED DATA ---
+        if not passed_df_final_output.empty:
             passed_file_name = get_generic_filename(f"{component_name}_passed", "data", "dat")
             passed_file_path = output_dir / passed_file_name
-            
-            # Find ActionCode column again after potential column filtering
-            actioncode_col = None
-            for col in passed_df_final_output.columns:
-                if col.strip().lower() == "actioncode":
-                    actioncode_col = col
-                    break
-            
-            # Calculate special_counter before writing .dat
-            if actioncode_col:
-                logger.info(f"Found ActionCode column: {actioncode_col}. Calculating special counter.")
-                special_counter = sum(
-                    str(row[actioncode_col]).strip().lower() in combined_actions
-                    for _, row in passed_df_final_output.iterrows()
-                )
-                logger.info(f"Special counter calculated: {special_counter} for ActionCode values.")
-            
-            # Write .dat file (pipe-separated, include header, all filtered columns)
             with open(passed_file_path, "w", encoding="utf-8") as f:
                 f.write("|".join([str(col) for col in passed_df_final_output.columns]) + "\n")
-                for index, row in passed_df_final_output.iterrows(): # Use index for dtype lookup
-                    formatted_values = []
-                    for col_name, value in row.items():
-                        # Check if the column's dtype is a datetime type
-                        if pd.api.types.is_datetime64_any_dtype(passed_df_final_output[col_name]):
-                            if pd.isna(value): # Handle NaT (Not a Time)
-                                formatted_values.append('')
-                            else:
-                                formatted_values.append(value.strftime('%Y/%m/%d')) # Format as %Y/%m/%d
-                        else:
-                            formatted_values.append(str(value) if value is not None else '')
-                    f.write("|".join(formatted_values) + "\n")
-            logger.info(f"Passed validation data saved to: {passed_file_path}. Special count: {special_counter}")
+                for _, row in passed_df_final_output.iterrows():
+                    f.write("|".join(format_row_for_dat(row, passed_df_final_output, column_type_map)) + "\n")
+            logger.info(f"Passed validation data saved to: {passed_file_path}")
+
+        # --- SAVE FAILED DATA ---
+        failed_file_name = None  # define upfront
 
         if not failed_df.empty:
-            failed_file_name = get_generic_filename(f"{component_name}_failed", "data", "xlsx")
+            failed_file_name = get_generic_filename("failed", component_name, "xlsx")
             failed_file_path = output_dir / failed_file_name
             tmp_path_failed = failed_file_path.with_suffix(".xlsx.tmp")
             failed_df.to_excel(tmp_path_failed, index=False, engine='openpyxl')
             os.replace(tmp_path_failed, failed_file_path)
             logger.info(f"Failed validation data saved to: {failed_file_path}")
 
-        # Return results
+
+
+        # --- PREPARE RESPONSE ---
         response_content = {
             "message": "Validation complete.",
-            "status": "success",
+            "status": "success" if failed_df.empty else "failed",
             "passed_records_count": len(passed_df_final_output),
             "failed_records_count": len(failed_df),
             "passed_file_url": f"http://localhost:8000/validation_results/{passed_file_name}" if passed_file_name else None,
             "failed_file_url": f"http://localhost:8000/validation_results/{failed_file_name}" if failed_file_name else None,
-            "errors": all_errors       
-         }
+            "errors": all_errors
+        }
 
-        if len(failed_df) > 0:
-            response_content["status"] = "failed"
-            response_content["message"] = "Validation completed with errors."
-        
         return JSONResponse(content=response_content)
+
 
     except FileNotFoundError as e:
         logger.error(f"File not found during validation: {e}")
