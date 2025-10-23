@@ -2648,6 +2648,24 @@ def load_validation_module(file_path: Path):
     return module
 
 
+def enforce_dtypes(df_to_cast, reference_dtypes):
+    for col, dtype in reference_dtypes.items():
+        if col not in df_to_cast.columns:
+            continue
+        try:
+            if "datetime" in str(dtype):
+                df_to_cast[col] = pd.to_datetime(df_to_cast[col], errors="coerce")
+            elif "int" in str(dtype):
+                df_to_cast[col] = pd.to_numeric(df_to_cast[col], errors="coerce").fillna(0).astype(int)
+            elif "float" in str(dtype):
+                df_to_cast[col] = pd.to_numeric(df_to_cast[col], errors="coerce")
+            else:
+                df_to_cast[col] = df_to_cast[col].astype(str)
+        except Exception as e:
+            logger.warning(f"Failed to enforce dtype for column {col}: {e}")
+    return df_to_cast
+
+
 @app.post("/api/hdl/validate-data")
 async def validate_data(payload: ValidatePayload):
     """
@@ -3136,6 +3154,48 @@ async def validate_data(payload: ValidatePayload):
 
         passed_df_final_output = passed_df[existing_cols_in_final_order]
         logger.info(f"Final columns for DAT file generation (ordered): {passed_df_final_output.columns.tolist()}")
+
+        # --- STEP: ENFORCE DATATYPE CONSISTENCY BEFORE SAVING ---
+        logger.info("Enforcing consistent dtypes for passed and failed DataFrames...")
+        reference_dtypes = df.dtypes.to_dict()  # Original Excel schema
+
+        def enforce_dtypes(df_to_cast, reference_dtypes):
+            for col, dtype in reference_dtypes.items():
+                if col not in df_to_cast.columns:
+                    continue
+                try:
+                    if "datetime" in str(dtype):
+                        df_to_cast[col] = pd.to_datetime(df_to_cast[col], errors="coerce")
+                    elif "int" in str(dtype):
+                        df_to_cast[col] = pd.to_numeric(df_to_cast[col], errors="coerce").fillna(0).astype(int)
+                    elif "float" in str(dtype):
+                        df_to_cast[col] = pd.to_numeric(df_to_cast[col], errors="coerce")
+                    else:
+                        df_to_cast[col] = df_to_cast[col].astype(str)
+                except Exception as e:
+                    logger.warning(f"Failed to enforce dtype for column {col}: {e}")
+            return df_to_cast
+
+        passed_df_final_output = enforce_dtypes(passed_df_final_output, reference_dtypes)
+        failed_df = enforce_dtypes(failed_df, reference_dtypes)
+        logger.info("Dtype enforcement completed.")
+
+        # --- FUNCTION TO FORMAT ROWS FOR DAT FILES ---
+        def format_row_for_dat(row, df):
+            formatted = []
+            for col, val in row.items():
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    if pd.isna(val):
+                        formatted.append('')
+                    else:
+                        # Date only if time is 00:00:00, else include timestamp
+                        if val.time() == datetime.min.time():
+                            formatted.append(val.strftime('%Y/%m/%d'))
+                        else:
+                            formatted.append(val.strftime('%Y/%m/%d %H:%M:%S'))
+                else:
+                    formatted.append(str(val) if val is not None else '')
+            return formatted
 
 
         # --- GENERATE .DAT FILE FOR PASSED DATA ---
