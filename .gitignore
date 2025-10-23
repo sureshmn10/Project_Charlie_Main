@@ -19,3 +19,10 @@ Server/hdl_jobs.json
 Server/server.log
 Server/.env
 Server/.env
+/NLP/venv
+/Server/venv 
+*.json
+*Lookup_Data_saved.xml
+*Mandatory_Fields_saved.xml
+soap_response.xml
+data.json
