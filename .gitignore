@@ -26,3 +26,4 @@ Server/.env
 *Mandatory_Fields_saved.xml
 soap_response.xml
 data.json
+*.txt
