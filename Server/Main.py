@@ -2509,6 +2509,7 @@ DATA_TYPE_MAPPING = {
     "DATETIME": "date",
     "BOOLEAN": "boolean",
     "BOOL": "boolean",
+    "TIMESTAMP": "timestamp",
 }
 
 def validate_data_types(df: pd.DataFrame, attributes: List[AttributeConfig]) -> pd.DataFrame:
@@ -5771,7 +5772,72 @@ async def MandatoryfieldsLoading(req: mandatoryFieldsReqOracle):
             logger.error(f"Response content: {e.response.text}")
         raise HTTPException(status_code=500, detail=f"SOAP call failed: {str(e)}")
 
+# Person report fetching 
+class AssignmentReportReqOracle(BaseModel):
+    customerName: str
+    instanceName: str
 
+
+@app.post("/api/hdl/oracle_fetch/AssignmentReport")
+async def MandatoryfieldsLoading(req: AssignmentReportReqOracle):
+    customerName = req.customerName
+    instanceName = req.instanceName
+
+    oracle_env, username, password = [x.strip() for x in load_oracle_credentials(customerName, instanceName)]
+    logger.warning(f"oracle credentials are, {oracle_env}, {username}, {password}")
+    
+    # Define SOAP save zone path
+    soap_save_zone = Path(f"{customerName}/{instanceName}/soap_temp_storage")
+    soap_save_zone.mkdir(parents=True, exist_ok=True)  # create dirs if they don't exist
+    Assignment_report_Directory = Path(f"Required_files/{customerName}_{instanceName}_Assignment_Report.xlsx")
+    Assignment_report_Directory.parent.mkdir(parents=True, exist_ok=True)
+
+    # SOAP service URL
+    SOAP_URL = f"{oracle_env}/xmlpserver/services/ExternalReportWSSService?wsdl"
+
+    headers = {
+        "Content-Type": "application/soap+xml; charset=utf-8",
+        "SOAPAction": "",
+    }
+
+    # Read from soap_request.xml
+    with open("soap_request_Assignment_Report.xml", "r", encoding="utf-8") as file:
+        soap_body = file.read().strip()
+
+    # Save a copy of the SOAP request XML to the soap_save_zone
+    try:
+        saved_file_path = soap_save_zone / "soap_request_Assignment_Report_saved.xml"
+        with open(saved_file_path, "w", encoding="utf-8") as f:
+            f.write(soap_body)
+        logger.info(f"SOAP request saved at: {saved_file_path}")
+    except Exception as save_err:
+        logger.error(f"Failed to save SOAP XML: {save_err}")
+
+    # Now make the actual SOAP call
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            #log everything
+            logger.info(f"Making SOAP request to {SOAP_URL} with user {username}")
+            response = await client.post(SOAP_URL, data=soap_body, headers=headers, auth=(username, password))
+            response.raise_for_status()
+            logger.info(f"SOAP request successful with status code {response.status_code}")
+            # log all the response code as well as content
+            logger.warning(f"Response content: {response.text[:500]}...")  # Log first 500 chars for brevity
+            saved_file_path = soap_save_zone / "soap_response_saved.xml"
+            with open(saved_file_path, "w", encoding="utf-8") as f:
+                f.write(response.text)
+            logger.info(f"SOAP request saved at: {saved_file_path}")
+
+            excel_path = parse_soap_response_to_excel(saved_file_path, LookupData_Directory)
+            return {
+                "status": "success",
+                "results": "Mandatory Fields loaded successfully"
+            }
+    except httpx.HTTPError as e:
+        logger.error(f"SOAP call failed: {str(e)}")
+        if e.response:
+            logger.error(f"Response content: {e.response.text}")
+        raise HTTPException(status_code=500, detail=f"SOAP call failed: {str(e)}")
 
 
 def parse_soap_response_to_excel(xml_path: str, output_excel_path: str = "output.xlsx", customerName: str = "", instanceName: str = "") -> str:
@@ -6416,3 +6482,5 @@ def oracle_value_check(request: OracleValueRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
         
+
+
