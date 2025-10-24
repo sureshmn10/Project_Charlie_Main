@@ -2794,7 +2794,7 @@ async def validate_data(payload: ValidatePayload):
         logger.info("Finished key values uniqueness validation.")
 
         # --- VALIDATE START DATE BEFORE END DATE ---
-        logger.info("Starting EffectiveStartDate < EffectiveEndDate validation...")
+        logger.info("Starting EffectiveStartDate <= EffectiveEndDate validation...")
 
         if "EffectiveStartDate" in df.columns and "EffectiveEndDate" in df.columns:
             # Ensure proper datetime format
