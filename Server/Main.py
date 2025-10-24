@@ -2797,22 +2797,48 @@ async def validate_data(payload: ValidatePayload):
         logger.info("Starting EffectiveStartDate <= EffectiveEndDate validation...")
 
         if "EffectiveStartDate" in df.columns and "EffectiveEndDate" in df.columns:
-            # Ensure proper datetime format
             df["EffectiveStartDate"] = pd.to_datetime(df["EffectiveStartDate"], errors="coerce")
             df["EffectiveEndDate"] = pd.to_datetime(df["EffectiveEndDate"], errors="coerce")
 
+            for idx, row in df.iterrows():
+                start = row["EffectiveStartDate"]
+                end = row["EffectiveEndDate"]
+
+                if pd.isna(start) or pd.isna(end):
+                    continue  # Skip blank dates
+
+                if end < start:
+                    logger.info(f"Row {idx} failed EffectiveStartDate <= EffectiveEndDate validation: {start} > {end}")
+                    reason = f"EffectiveEndDate ({end.date()}) is before EffectiveStartDate ({start.date()})"
+                else:
+                    continue  # Valid → skip
+
+                existing_reason = df.at[idx, "Reason for Failed"] if "Reason for Failed" in df.columns else ""
+                df.at[idx, "Reason for Failed"] = f"{existing_reason}; {reason}" if existing_reason else reason
+
+        logger.info("Completed EffectiveStartDate <= EffectiveEndDate validation.")
+
+
+
+
+        logger.info("Completed StartDate <= EndDate validation.")
+
+        if "StartDate" in df.columns and "EndDate" in df.columns:
+            # Ensure proper datetime format
+            df["StartDate"] = pd.to_datetime(df["StartDate"], errors="coerce")
+            df["EndDate"] = pd.to_datetime(df["EndDate"], errors="coerce")
+
             # Find rows where start date is missing or not before end date
-            invalid_mask = df["EffectiveEndDate"] <= df["EffectiveStartDate"]
+            invalid_mask = df["EndDate"] <= df["StartDate"]
             if invalid_mask.any():
                 for idx in df[invalid_mask].index:
-                    start = df.at[idx, "EffectiveStartDate"]
-                    end = df.at[idx, "EffectiveEndDate"]
+                    start = df.at[idx, "StartDate"]
+                    end = df.at[idx, "EndDate"]
                     existing_reason = df.at[idx, "Reason for Failed"]
-                    reason = f"EffectiveStartDate ({start.date()}) must be before EffectiveEndDate ({end.date()})"
+                    reason = f"StartDate ({start.date()}) must be before EndDate ({end.date()})"
                     df.at[idx, "Reason for Failed"] = f"{existing_reason}; {reason}" if existing_reason else reason
 
-        logger.info("Completed EffectiveStartDate < EffectiveEndDate validation.")
-
+        logger.info("Completed StartDate <= EffectiveEndDate validation.")
 
         # 3. Perform Lookup Validations (after transformation and required field checks)
         logger.info("Starting lookup validations.")
