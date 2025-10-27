@@ -2521,10 +2521,22 @@ DATA_TYPE_MAPPING = {
 def is_oracle_safe_date(value: str) -> bool:
     """
     Oracle allows years from 4712 BC to 9999 AD.
-    We'll allow anything with year >= 4712 or <= 9999.
+    Accepts both YYYY/MM/DD and MM/DD/YYYY formats.
     """
     try:
-        year = int(str(value)[:4])
+        # Try to extract year intelligently
+        parts = re.split(r"[-/]", str(value))
+        parts = [p for p in parts if p.strip()]
+
+        if not parts:
+            return False
+
+        # Detect if first part is year or last part
+        if len(parts[0]) == 4:  # YYYY/MM/DD
+            year = int(parts[0])
+        else:  # MM/DD/YYYY or DD/MM/YYYY
+            year = int(parts[-1])
+
         return 4712 <= year <= 9999
     except Exception:
         return False
