@@ -6724,3 +6724,95 @@ def oracle_value_check(request: OracleValueRequest):
         
 
 
+def detect_value_type(value, defined_type: str):
+    """Parse the value based on defined data type."""
+    if pd.isna(value) or str(value).strip() == "":
+        return "", "string"
+
+    t = defined_type.lower()
+    try:
+        if t in ["integer", "int"]:
+            return int(float(value)), "integer"
+        elif t in ["float", "number", "decimal"]:
+            return float(value), "float"
+        elif t in ["boolean", "bool"]:
+            str_val = str(value).strip().lower()
+            if str_val in ["true", "1", "yes", "y"]:
+                return True, "boolean"
+            elif str_val in ["false", "0", "no", "n"]:
+                return False, "boolean"
+            return "", "boolean"
+        elif t in ["date", "datetime"]:
+            try:
+                parsed_date = pd.to_datetime(value, errors="coerce")
+                if pd.isna(parsed_date):
+                    return str(value), "string"
+                return parsed_date.strftime("%Y-%m-%d"), "date"
+            except Exception:
+                return str(value), "string"
+        elif t == "timestamp":
+            try:
+                parsed_date = pd.to_datetime(value, errors="coerce")
+                if pd.isna(parsed_date):
+                    return str(value), "string"
+                return parsed_date.strftime("%Y-%m-%d %H:%M:%S"), "timestamp"
+            except Exception:
+                return str(value), "string"
+        else:
+            return str(value), "string"
+    except Exception:
+        return str(value), "string"
+
+@app.post("/api/parse-file")
+async def parse_file(
+    file: UploadFile,
+    columnDataTypes: str = Form("{}")
+):
+    """
+    Reads an uploaded Excel or DAT file, parses each column value based on data types,
+    and returns structured JSON with rows and columns.
+    """
+    try:
+        # 🧠 Convert JSON string to Python dict safely
+        try:
+            columnDataTypes = json.loads(columnDataTypes)
+        except json.JSONDecodeError:
+            columnDataTypes = {}
+
+        content = await file.read()
+        filename = file.filename.lower()
+
+        # Read Excel or DAT
+        if filename.endswith(".xlsx") or filename.endswith(".xls"):
+            df = pd.read_excel(io.BytesIO(content))
+        elif filename.endswith(".dat"):
+            df = pd.read_csv(io.BytesIO(content), sep="|")
+        else:
+            return JSONResponse(content={"error": "Unsupported file type"}, status_code=400)
+
+        df.columns = [str(c).strip() for c in df.columns]
+
+        parsed_rows = []
+        for idx, row in df.iterrows():
+            row_obj = {"id": idx + 1}
+            for col in df.columns:
+                defined_type = columnDataTypes.get(col, "string").upper()
+                mapped_type = DATA_TYPE_MAPPING.get(defined_type, "string")
+                value, val_type = detect_value_type(row[col], mapped_type)
+                row_obj[col] = value
+                row_obj[f"{col}_type"] = val_type
+            parsed_rows.append(row_obj)
+
+        parsed_columns = [
+            {
+                "field": col,
+                "headerName": col,
+                "type": DATA_TYPE_MAPPING.get(columnDataTypes.get(col, "string").upper(), "string"),
+            }
+            for col in df.columns
+        ]
+
+        return {"columns": parsed_columns, "rows": parsed_rows}
+
+    except Exception as e:
+        return JSONResponse(content={"error": f"Failed to parse file: {str(e)}"}, status_code=500)
