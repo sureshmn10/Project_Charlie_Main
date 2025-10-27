@@ -27,3 +27,4 @@ Server/.env
 soap_response.xml
 data.json
 *.txt
+Server/Required_files/Available_NLP.xlsx
