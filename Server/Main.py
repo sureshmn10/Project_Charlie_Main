@@ -1258,7 +1258,7 @@ async def save_code(request: Request):
         return {"success": False, "error": str(e)}
 
 
-@app.post("/api/hdl/nlr/batch")
+@app.post("/api/hdl/nlp/batch")
 def get_nlr_rules_batch(
     attributes: List[str] = Body(..., embed=True, alias="attributes")
 ):
@@ -2495,12 +2495,18 @@ def get_hdl_setup_validate_fetch(customer_name: str, instance_name: str) -> dict
         raise HTTPException(status_code=500, detail=f"Error fetching setup: {e}")
 
 
+import pandas as pd
+from typing import List
+
+import pandas as pd
+from typing import List
+
 DATA_TYPE_MAPPING = {
     "VARCHAR": "string",
     "CHAR": "string",
     "TEXT": "string",
     "STRING": "string",
-    "NUMBER": "float",  # or "integer" if you know it's always int
+    "NUMBER": "float",
     "INTEGER": "integer",
     "INT": "integer",
     "FLOAT": "float",
@@ -2512,11 +2518,23 @@ DATA_TYPE_MAPPING = {
     "TIMESTAMP": "timestamp",
 }
 
-def validate_data_types(df: pd.DataFrame, attributes: List[AttributeConfig]) -> pd.DataFrame:
+def is_oracle_safe_date(value: str) -> bool:
+    """
+    Oracle allows years from 4712 BC to 9999 AD.
+    We'll allow anything with year >= 4712 or <= 9999.
+    """
+    try:
+        year = int(str(value)[:4])
+        return 4712 <= year <= 9999
+    except Exception:
+        return False
+
+
+def validate_data_types(df: pd.DataFrame, attributes: List) -> pd.DataFrame:
     """
     Validate each column's values against its expected data_type.
     Updates 'Reason for Failed' column with errors.
-    Supports mapping of SQL/HCM types to Python types.
+    Keeps Oracle-safe dates (4712–9999) as strings to avoid NaT conversion.
     """
     for attr in attributes:
         col = attr.Attributes
@@ -2524,18 +2542,21 @@ def validate_data_types(df: pd.DataFrame, attributes: List[AttributeConfig]) -> 
         expected_type = DATA_TYPE_MAPPING.get(dtype_raw)
 
         if not expected_type:
-            # Unknown type, skip or log
             for idx in df.index:
                 existing_reason = df.at[idx, "Reason for Failed"]
-                df.at[idx, "Reason for Failed"] = f"{existing_reason}; Unknown data_type '{attr.data_type}' specified for column." if existing_reason else f"Unknown data_type '{attr.data_type}' specified for column."
+                df.at[idx, "Reason for Failed"] = (
+                    f"{existing_reason}; Unknown data_type '{attr.data_type}' specified for column."
+                    if existing_reason else
+                    f"Unknown data_type '{attr.data_type}' specified for column."
+                )
             continue
 
         if col not in df.columns:
-            continue  # Skip missing columns
+            continue
 
         for idx, val in df[col].items():
             if val == "" or pd.isna(val):
-                continue  # Empty values handled by required field validation
+                continue
             reason = ""
             try:
                 if expected_type == "string":
@@ -2548,18 +2569,29 @@ def validate_data_types(df: pd.DataFrame, attributes: List[AttributeConfig]) -> 
                 elif expected_type == "boolean":
                     if str(val).strip().upper() not in ["TRUE", "FALSE", "1", "0"]:
                         reason = f"Expected boolean (TRUE/FALSE/1/0) but got '{val}'"
-                elif expected_type == "date":
-                    pd.to_datetime(val, errors='raise')
-                elif expected_type == "timestamp":
-                    pd.to_datetime(val, errors='raise')
+                elif expected_type in ["date", "timestamp"]:
+                    # Oracle-safe date? keep it as raw string
+                    if is_oracle_safe_date(str(val)):
+                        df.at[idx, col] = str(val)
+                    else:
+                        # Only parse valid modern dates
+                        parsed = pd.to_datetime(val, errors='raise')
+                        df.at[idx, col] = parsed.strftime("%Y/%m/%d")
             except Exception:
                 reason = f"Value '{val}' does not match expected data_type '{expected_type}'"
 
             if reason:
                 existing_reason = df.at[idx, "Reason for Failed"]
-                df.at[idx, "Reason for Failed"] = f"{existing_reason}; {reason}" if existing_reason else reason
+                df.at[idx, "Reason for Failed"] = (
+                    f"{existing_reason}; {reason}" if existing_reason else reason
+                )
+
+        # Ensure column stays as string to preserve Oracle special dates
+        if expected_type in ["date", "timestamp"]:
+            df[col] = df[col].astype(str)
 
     return df
+
 
 def apply_workrelationship_rules(df: pd.DataFrame,
                                 hire_actions: list,
@@ -3183,59 +3215,104 @@ async def validate_data(payload: ValidatePayload):
 
         # --- STEP: ENFORCE DATATYPE CONSISTENCY BEFORE SAVING ---
         logger.info("Enforcing consistent dtypes for passed and failed DataFrames...")
-        reference_dtypes = df.dtypes.to_dict()  # Original Excel schema
+        # Capture reference dtypes before enforcing consistency
+        reference_dtypes = df.dtypes.to_dict()
 
-        def enforce_dtypes(df_to_cast, reference_dtypes):
+        # ------------------ START PATCH: Preserve Oracle-safe dates ------------------
+        # helper: detect oracle-safe year (year >= 4712 up to 9999)
+        def _is_oracle_safe_date_str(s: Any) -> bool:
+            try:
+                s = str(s).strip()
+                # Accept formats like YYYY-MM-DD, YYYY/MM/DD, YYYYMMDD, YYYY-MM-DD HH:MM:SS etc.
+                m = re.match(r'^(-?\d{4})', s)
+                if not m:
+                    return False
+                year = int(m.group(1))
+                return 4712 <= year <= 9999
+            except Exception:
+                return False
+
+        # Build a mask map: for each date/datetime column from payload, mark rows that are oracle-safe strings.
+        oracle_safe_mask = {}  # col -> boolean Series (index same as df)
+        date_cols_from_payload = [attr.Attributes for attr in attributes_to_validate if str(attr.data_type).lower() in ("date","datetime","timestamp")]
+
+        for col in date_cols_from_payload:
+            if col in df.columns:
+                # Build mask from original df (before we coerce to datetimes)
+                oracle_safe_mask[col] = df[col].apply(lambda v: _is_oracle_safe_date_str(v))
+            else:
+                oracle_safe_mask[col] = pd.Series(False, index=df.index)
+
+        # After split, ensure passed_df retains original string values for oracle-safe rows.
+        # But first ensure passed_df exists (it does)
+        # Fill missing EffectiveEndDate in passed_df with oracle default as string BEFORE dtype enforcement
+        if "EffectiveEndDate" in passed_df.columns:
+            passed_df["EffectiveEndDate"] = passed_df["EffectiveEndDate"].astype("object")
+            passed_df.loc[
+                passed_df["EffectiveEndDate"].astype(str).str.strip() == "", "EffectiveEndDate"
+            ] = "4712/12/31"
+
+        # Also if EffectiveStartDate blank and StartDate present, fallback
+        if "EffectiveStartDate" in passed_df.columns:
+            passed_df["EffectiveStartDate"] = passed_df["EffectiveStartDate"].replace({pd.NaT: "", None: ""})
+            if "StartDate" in passed_df.columns:
+                mask_missing_start = passed_df["EffectiveStartDate"].astype(str).str.strip() == ""
+                passed_df.loc[mask_missing_start & passed_df["StartDate"].astype(str).str.strip().ne(""), "EffectiveStartDate"] = passed_df.loc[mask_missing_start & passed_df["StartDate"].astype(str).str.strip().ne(""), "StartDate"].astype(str)
+            # if still empty, optionally leave as "" or set to 1900/01/01. skip here.
+
+        # Now update df used downstream for dtype enforcement: we want to preserve oracle-safe strings in passed_df_final_output later.
+        # The enforce functions below will reference `oracle_safe_mask` and will avoid coercing those cells.
+
+        # Replace enforce_dtypes and enforce_payload_dtypes with oracle-aware versions
+
+        def enforce_dtypes_oracle_aware(df_to_cast, reference_df=None):
+            """
+            Enforce data types from reference_df (usually the original dataframe) onto df_to_cast.
+            Special handling for Oracle-safe date strings.
+            """
+            if reference_df is not None:
+                reference_dtypes = reference_df.dtypes.to_dict()
+            else:
+                reference_dtypes = df_to_cast.dtypes.to_dict()  # fallback if nothing is passed
+
             for col, dtype in reference_dtypes.items():
                 if col not in df_to_cast.columns:
                     continue
-                try:
-                    if "datetime" in str(dtype):
-                        df_to_cast[col] = pd.to_datetime(df_to_cast[col], errors="coerce")
-                    elif "int" in str(dtype):
-                        df_to_cast[col] = pd.to_numeric(df_to_cast[col], errors="coerce").fillna(0).astype(int)
-                    elif "float" in str(dtype):
-                        df_to_cast[col] = pd.to_numeric(df_to_cast[col], errors="coerce")
-                    else:
-                        df_to_cast[col] = df_to_cast[col].astype(str)
-                except Exception as e:
-                    logger.warning(f"Failed to enforce dtype for column {col}: {e}")
+
+                # Skip dtype enforcement for Oracle-safe date strings
+                if col in oracle_safe_mask and oracle_safe_mask[col].any():
+                    mask = oracle_safe_mask[col]
+                    temp_series = df_to_cast[col].copy()
+                    try:
+                        coerced = pd.to_datetime(temp_series, errors="coerce")
+                        coerced = coerced.astype("datetime64[ns]")
+                        coerced[mask] = temp_series[mask]  # restore oracle-safe strings
+                        df_to_cast[col] = coerced
+                    except Exception as e:
+                        logger.warning(f"Could not safely enforce datetime dtype on {col}: {e}")
+                else:
+                    try:
+                        df_to_cast[col] = df_to_cast[col].astype(dtype)
+                    except Exception as e:
+                        logger.warning(f"Could not enforce dtype {dtype} on {col}: {e}")
+
             return df_to_cast
 
-        passed_df_final_output = enforce_dtypes(passed_df_final_output, reference_dtypes)
-        failed_df = enforce_dtypes(failed_df, reference_dtypes)
-        logger.info("Dtype enforcement completed.")
 
-        # --- FUNCTION TO FORMAT ROWS FOR DAT FILES ---
-        def format_row_for_dat(row, df):
-            formatted = []
-            for col, val in row.items():
-                if pd.api.types.is_datetime64_any_dtype(df[col]):
-                    if pd.isna(val):
-                        formatted.append('')
-                    else:
-                        # Date only if time is 00:00:00, else include timestamp
-                        if val.time() == datetime.min.time():
-                            formatted.append(val.strftime('%Y/%m/%d'))
-                        else:
-                            formatted.append(val.strftime('%Y/%m/%d %H:%M:%S'))
-                else:
-                    formatted.append(str(val) if val is not None else '')
-            return formatted
-
-
-        # --- ENFORCE DATATYPES FROM PAYLOAD ---
-        logger.info("Enforcing datatypes based on payload attributes...")
-        # Create a dict mapping column -> expected type from payload
-        column_type_map = {attr.Attributes: attr.data_type for attr in attributes_to_validate}
-
-        def enforce_payload_dtypes(df_to_cast, column_type_map):
+        def enforce_payload_dtypes_oracle_aware(df_to_cast, column_type_map):
             for col, dtype in column_type_map.items():
                 if col not in df_to_cast.columns:
                     continue
                 try:
                     if dtype.lower() in ["date", "datetime", "timestamp"]:
-                        df_to_cast[col] = pd.to_datetime(df_to_cast[col], errors="coerce")
+                        # cell-by-cell: keep oracle-safe strings, parse others
+                        new_vals = []
+                        for idx, val in df_to_cast[col].items():
+                            if _is_oracle_safe_date_str(val):
+                                new_vals.append(str(val).replace('-', '/'))
+                            else:
+                                new_vals.append(pd.to_datetime(val, errors='coerce'))
+                        df_to_cast[col] = pd.Series(new_vals, index=df_to_cast.index)
                     elif dtype.lower() in ["int", "integer"]:
                         df_to_cast[col] = pd.to_numeric(df_to_cast[col], errors="coerce").fillna(0).astype(int)
                     elif dtype.lower() in ["float", "double", "decimal"]:
@@ -3246,27 +3323,89 @@ async def validate_data(payload: ValidatePayload):
                     logger.warning(f"Failed to cast column {col} to {dtype}: {e}")
             return df_to_cast
 
-        passed_df_final_output = enforce_payload_dtypes(passed_df_final_output, column_type_map)
-        failed_df = enforce_payload_dtypes(failed_df, column_type_map)
-        logger.info("Datatype enforcement from payload completed.")
+        # Replace calls
+        passed_df_final_output = enforce_dtypes_oracle_aware(passed_df_final_output)
+        failed_df = enforce_dtypes_oracle_aware(failed_df)
+        logger.info("Dtype enforcement completed (oracle-aware).")
 
-        # --- FORMAT ROWS FOR DAT FILE ---
+        # Build column_type_map dynamically from payload
+        column_type_map = {}
+        for attr in attributes_to_validate:
+            col_name = attr.Attributes
+            dtype = str(attr.data_type).lower() if hasattr(attr, "data_type") else "string"
+            column_type_map[col_name] = dtype
+
+
+        # Update payload-enforcement cast
+        passed_df_final_output = enforce_payload_dtypes_oracle_aware(passed_df_final_output, column_type_map)
+        failed_df = enforce_payload_dtypes_oracle_aware(failed_df, column_type_map)
+        logger.info("Datatype enforcement from payload completed (oracle-aware).")
+
+        # Fix format_row_for_dat: accept both datetime objects and oracle date-strings
         def format_row_for_dat(row, df, column_type_map):
             formatted = []
             for col, val in row.items():
                 dtype = column_type_map.get(col, None)
+                # If val is a string and looks like an oracle-safe date (YYYY/MM/DD or YYYY-MM-DD), just normalize and append
+                if isinstance(val, str) and _is_oracle_safe_date_str(val):
+                    s = val.replace('-', '/')
+                    # if it's already YYYY/MM/DD or YYYY/MM/DD HH:MM:SS keep as needed
+                    if re.match(r'^\d{4}/\d{2}/\d{2}$', s):
+                        formatted.append(s)
+                    else:
+                        # try to normalize date portion only
+                        formatted.append(s.split(' ')[0])
+                    continue
+
                 if dtype and dtype.lower() in ["date", "datetime", "timestamp"]:
                     if pd.isna(val):
                         formatted.append('')
                     else:
-                        if dtype.lower() == "date":
-                            formatted.append(val.strftime('%Y/%m/%d'))
-                        else:  # datetime or timestamp
-                            formatted.append(val.strftime('%Y/%m/%d %H:%M:%S'))
+                        # If pandas Timestamp:
+                        if isinstance(val, (pd.Timestamp, datetime)):
+                            if dtype.lower() == "date":
+                                formatted.append(val.strftime('%Y/%m/%d'))
+                            else:
+                                # datetime or timestamp
+                                formatted.append(val.strftime('%Y/%m/%d %H:%M:%S'))
+                        else:
+                            # fallback: convert to string and try to normalize separators
+                            s = str(val).replace('-', '/')
+                            formatted.append(s)
                 else:
                     formatted.append(str(val) if val is not None else '')
             return formatted
 
+        # ------------------ END PATCH ------------------
+        # ---------------- Oracle 4712-Year Safe Patch ----------------
+        def enforce_oracle_safe_dates(df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Ensures Oracle-compatible '4712' and null dates are preserved as strings.
+            Prevents pandas datetime64 truncation and NaT display issues.
+            """
+            for col in df.columns:
+                if "date" in col.lower():
+                    # Convert full column to string before any replacements
+                    df[col] = df[col].astype(str)
+
+                    # Replace NaT or NaN with empty string
+                    df[col] = df[col].replace(["NaT", "nan", "NaN"], "")
+
+                    # Replace blanks with Oracle's max date
+                    df.loc[df[col].str.strip() == "", col] = df[col].apply(
+                        lambda x: "4712/12/31" if x.strip() == "" else x
+                    )
+
+                    # Ensure consistent format
+                    df[col] = df[col].apply(
+                        lambda x: x.replace("-", "/") if "/" not in x else x
+                    )
+            return df
+
+        # Apply before exporting both passed and failed dataframes
+        passed_df_final_output = enforce_oracle_safe_dates(passed_df_final_output)
+        failed_df = enforce_oracle_safe_dates(failed_df)
+        # -------------------------------------------------------------
         # --- SAVE PASSED DATA ---
         passed_file_name = None  # define upfront
 
