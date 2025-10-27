@@ -2849,23 +2849,45 @@ async def validate_data(payload: ValidatePayload):
                 end = row["EffectiveEndDate"]
 
                 if pd.isna(start) or pd.isna(end):
-                    continue  # Skip blank dates
+                    continue  
 
                 if end < start:
                     logger.info(f"Row {idx} failed EffectiveStartDate <= EffectiveEndDate validation: {start} > {end}")
                     reason = f"EffectiveEndDate ({end.date()}) is before EffectiveStartDate ({start.date()})"
                 else:
-                    continue  # Valid → skip
+                    continue  
 
                 existing_reason = df.at[idx, "Reason for Failed"] if "Reason for Failed" in df.columns else ""
                 df.at[idx, "Reason for Failed"] = f"{existing_reason}; {reason}" if existing_reason else reason
 
         logger.info("Completed EffectiveStartDate <= EffectiveEndDate validation.")
 
+        logger.info("Starting DateFrom <= DateTo validation...")
+
+        if "DateFrom" in df.columns and "DateTo" in df.columns:
+            df["DateFrom"] = pd.to_datetime(df["DateFrom"], errors="coerce")
+            df["DateTo"] = pd.to_datetime(df["EffectiveEndDate"], errors="coerce")
+
+            for idx, row in df.iterrows():
+                start = row["DateFrom"]
+                end = row["DateTo"]
+
+                if pd.isna(start) or pd.isna(end):
+                    continue  
+
+                if end < start:
+                    logger.info(f"Row {idx} failed DateFrom <= DateTo validation: {start} > {end}")
+                    reason = f"DateTo ({end.date()}) is before DateFrom ({start.date()})"
+                else:
+                    continue 
+
+                existing_reason = df.at[idx, "Reason for Failed"] if "Reason for Failed" in df.columns else ""
+                df.at[idx, "Reason for Failed"] = f"{existing_reason}; {reason}" if existing_reason else reason
+
+        logger.info("Completed DateFrom <= DateTo validation.")
 
 
-
-        logger.info("Completed StartDate <= EndDate validation.")
+        logger.info("Started StartDate <= EndDate validation.")
 
         if "StartDate" in df.columns and "EndDate" in df.columns:
             # Ensure proper datetime format
