@@ -2866,7 +2866,7 @@ async def validate_data(payload: ValidatePayload):
 
         if "DateFrom" in df.columns and "DateTo" in df.columns:
             df["DateFrom"] = pd.to_datetime(df["DateFrom"], errors="coerce")
-            df["DateTo"] = pd.to_datetime(df["EffectiveEndDate"], errors="coerce")
+            df["DateTo"] = pd.to_datetime(df["DateTo"], errors="coerce")
 
             for idx, row in df.iterrows():
                 start = row["DateFrom"]
