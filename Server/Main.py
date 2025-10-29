@@ -1202,60 +1202,103 @@ async def proxy_nlp_validate(request: Request):
 
 @app.post("/api/hdl/save_code")
 async def save_code(request: Request):
-    """
-    Receives Python code, attribute, rules, and conditions from the chatbot component, saves the code as a .py file named after the attribute, and updates an Excel sheet with the rules and conditions.
-    """
     try:
-        import openpyxl
         payload = await request.json()
         code = payload.get("code", "")
-        componentName = payload.get("component_name", "Default")
-        attribute = payload.get("attribute", "")
-        rules = payload.get("rules", [])
+        componentName = payload.get("component_name", "")
+        rules = payload.get("rules", {})
         conditions = payload.get("conditions", [])
-        customerName = payload.get("customerName","")
+        customerName = payload.get("customerName", "")
         instanceName = payload.get("instanceName", "")
-        # Sanitize attribute for filename
-        safe_attribute = "_".join(attribute.strip().split()) or "untitled"
+
+        if not componentName:
+            return {"success": False, "error": "component_name missing"}
+
+        # Filename pattern
+        filename = f"{customerName}_{instanceName}_{componentName}.py"
+
         save_dir = UPLOAD_DIR / "saved_code"
         save_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{customerName}_{instanceName}_{componentName}.py"
         file_path = save_dir / filename
-        # Save only the code as a .py file
+
+        # Save python code
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(code)
-        # --- Update Excel sheet ---
-        excel_path = Path("Required_files/Available_NLP.xlsx")
-        if excel_path.exists():
-            wb = openpyxl.load_workbook(excel_path)
-            ws = wb.active
-            found = False
-            # Ensure header has 'File Name' column
-            header = [cell.value for cell in ws[1]]
-            if 'File Name' not in header:
-                ws.cell(row=1, column=len(header)+1, value='File Name')
-                header.append('File Name')
-            file_name_col = header.index('File Name') + 1
-            for row in ws.iter_rows(min_row=2):
-                cell_attr = str(row[0].value).strip() if row[0].value else ""
-                if cell_attr.lower() == attribute.strip().lower():
-                    row[1].value = ", ".join(rules) if rules else ""
-                    row[2].value = ", ". join(conditions) if conditions else ""
-                    row[file_name_col-1].value = filename
-                    found = True
-                    break
-            if not found:
-                new_row = [attribute, ", ".join(rules), ", ". join(conditions)]
-                # Pad with empty cells if needed
-                while len(new_row) < file_name_col-1:
-                    new_row.append("")
-                new_row.append(filename)
-                ws.append(new_row)
-            wb.save(excel_path)
-        return {"success": True, "message": "Python code and Excel updated successfully.", "file": str(file_path)}
+
+        # Load existing JSON
+        json_path = Path("Required_files/Available_NLP.json")
+        data = []
+        if json_path.exists():
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except:
+                data = []
+
+        # Update or insert
+        found = False
+        for item in data:
+            if item.get("file_name") == filename:
+                item["rules"] = rules
+                item["conditions"] = conditions
+                found = True
+                break
+
+        if not found:
+            data.append({
+                "component": componentName,
+                "file_name": filename,
+                "rules": rules,
+                "conditions": conditions
+            })
+
+        # Save JSON
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        return {
+            "success": True,
+            "message": "Code and rules stored successfully",
+            "file": str(file_path)
+        }
+
     except Exception as e:
-        logger.error(f"Error saving code from chatbot: {e}")
+        logger.error(f"Save Code Error: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
+
+
+JSON_PATH = Path("Required_files/Available_NLP.json")
+
+
+@app.get("/api/hdl/get_rules")
+async def get_rules(customerName: str, instanceName: str, componentName: str):
+    try:
+        json_path = Path("Required_files/Available_NLP.json")
+        if not json_path.exists():
+            return {"rules": []}
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Match stored filename pattern
+        expected_filename = f"{customerName}_{instanceName}_{componentName}.py"
+
+        for item in data:
+            if item.get("file_name") == expected_filename:
+                rules_obj = item.get("rules", {})
+
+                # Convert rule object → frontend expected array format
+                normalized_rules = [
+                    {"nlr": rule_data.get("rule", ""), "column": col}
+                    for col, rule_data in rules_obj.items()
+                ]
+
+                return {"rules": normalized_rules}
+
+        return {"rules": []}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load rules: {str(e)}")
 
 
 @app.post("/api/hdl/nlp/batch")
