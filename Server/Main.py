@@ -1349,41 +1349,7 @@ def get_nlr_rules_batch(
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"NLR rules batch lookup failed: {str(e)}"})
 
-@app.get("/api/hdl/get_rules")
-def get_nlr_rules_for_attribute(attribute: str = Query(..., description="The attribute (HDL) to fetch NLR rules for.")):
-    """
-    Returns NLR rules and conditions for a single attribute from 'Required_files/Available_NLP.xlsx'.
-    """
-    try:
-        import openpyxl
-        excel_path = Path("Required_files/Available_NLP.xlsx")
-        if not excel_path.exists():
-            return JSONResponse(status_code=404, content={"error": "NLR rules file not found."})
-
-        wb = openpyxl.load_workbook(excel_path)
-        ws = wb.active
-
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            attr = str(row[0]).strip() if row[0] else ""
-            if attr.lower() == attribute.strip().lower():
-                rules = str(row[1]).strip() if row[1] else ""
-                conditions = str(row[2]).strip() if row[2] else ""
-                rules_list = rules.split(", ") if rules else []
-                conditions_list = conditions.split(", ") if conditions else []
-                return {
-                    "attribute": attr,
-                    "rules": rules_list,
-                    "conditions": conditions_list
-                }
-        # If not found
-        return {
-            "attribute": attribute,
-            "rules": [],
-            "conditions": []
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"NLR rules lookup failed: {str(e)}"})
-    
+  
 
 # DIR for bulk excel upload (redefined for clarity, or can use UPLOAD_DIR)
 DIR = Path("uploads/Excel_Files")
