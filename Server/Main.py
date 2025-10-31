@@ -3289,7 +3289,7 @@ async def validate_data(payload: ValidatePayload):
         # After split, ensure passed_df retains original string values for oracle-safe rows.
         # But first ensure passed_df exists (it does)
         # Fill missing EffectiveEndDate in passed_df with oracle default as string BEFORE dtype enforcement
-        if "EffectiveEndDate" and component_name.lower() != "workrelationship"  in passed_df.columns:
+        if "EffectiveEndDate" and component_name.lower() == "workrelationship"  in passed_df.columns:
             passed_df["EffectiveEndDate"] = passed_df["EffectiveEndDate"].replace({pd.NaT: "", None: ""})
             mask_missing_end = passed_df["EffectiveEndDate"].astype(str).str.strip() == ""
             passed_df.loc[mask_missing_end, "EffectiveEndDate"] = ""
