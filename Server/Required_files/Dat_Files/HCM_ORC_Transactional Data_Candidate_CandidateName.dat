@@ -1,0 +1,3 @@
+METADATA|CandidateName|SourceSystemOwner|SourceSystemId|PersonId(SourceSystemId)|NameType|CandidateNumber|EffectiveStartDate|LastName|FirstName|Suffix|MiddleNames|KnownAs|PreviousLastName
+MERGE|CandidateName|TEST|US_NME_10001|CAN091|GLOBAL|CAN101|2025/10/22|Halpin|Kate|||Kate|
+MERGE|CandidateName|TEST|US_NME_10002|CAN092|GLOBAL|CAN102|2025/10/22|Help|Ka|||Ka|

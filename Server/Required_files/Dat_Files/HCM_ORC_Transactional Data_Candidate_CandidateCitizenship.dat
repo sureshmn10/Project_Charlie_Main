@@ -1,0 +1,3 @@
+METADATA|CandidateCitizenship|SourceSystemOwner|SourceSystemId|CandidateNumber|DateFrom|CitizenshipStatus|LegislationCode
+MERGE|CandidateCitizenship|TEST|US_CTI_H1_091|CAN101|2025/10/22|ACTIVE|US
+MERGE|CandidateCitizenship|TEST|US_CTI_H1_092|CAN102|2025/10/22|ACTIVE|US

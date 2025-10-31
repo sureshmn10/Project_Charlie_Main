@@ -1,0 +1,3 @@
+METADATA|CandidateEmail|SourceSystemOwner|SourceSystemId|CandidateNumber|DateFrom|EmailAddress|EmailType|PrimaryEmailFlag
+MERGE|CandidateEmail|TEST|US_EMAIL_H1_091|CAN101|2025/10/22|Kate_Halpin@XYZ.com|H1|Y
+MERGE|CandidateEmail|TEST|US_EMAIL_H1_092|CAN102|2025/10/22|don_Halin@XYZ.com|H1|Y

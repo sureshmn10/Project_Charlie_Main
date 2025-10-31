@@ -1,0 +1,3 @@
+METADATA|CandidateNationalIdentifier|SourceSystemOwner|SourceSystemId|CandidateNumber|LegislationCode|NationalIdentifierType|NationalIdentifierNumber
+MERGE|CandidateNationalIdentifier|TEST|US_SSN_10001|CAN101|US|SSN|489-36-8350
+MERGE|CandidateNationalIdentifier|TEST|US_SSN_10002|CAN102|US|SSN|514-14-8905

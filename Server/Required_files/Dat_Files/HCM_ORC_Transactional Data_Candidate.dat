@@ -1,0 +1,3 @@
+METADATA|Candidate|SourceSystemId|SourceSystemOwner|CandidateNumber|PrefPhoneCntTypeCode|ObjectStatus|AvailabilityDate|StartDate|AddedByFlowCode|ConfirmedFlag|VisibleToCandidateFlag|CandPrefLanguageCode
+MERGE|Candidate|CAN091|TEST|CAN101|HM|Active|2025/10/24 00:00:00|2025/10/22|ORA_INTERNAL|Y|Y|US
+MERGE|Candidate|CAN092|TEST|CAN102|HM|Active|2025/10/24 00:00:00|2025/10/22|ORA_INTERNAL|Y|Y|US

@@ -1,0 +1,3 @@
+METADATA|CandidatePhone|SourceSystemId|SourceSystemOwner|CandidateNumber|AreaCode|PhoneNumber|PhoneType|DateFrom|LegislationCode
+MERGE|CandidatePhone|CAN001_PHONE|TEST|CAN101|749|3111227|HM|2025/10/22|US
+MERGE|CandidatePhone|CAN002_PHONE|TEST|CAN102|749|3111229|HM|2025/10/22|US
