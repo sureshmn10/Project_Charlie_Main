@@ -1,2 +1,2 @@
-METADATA|CandidateAddress|CandidateNumber|AddressLine1|AddressLine2|AddressLine3|AddressLine4|Building|FloorNumber|TownOrCity|Region1|Region2|Region3|Country|PostalCode|EffectiveStartDate|AddressType|SourceSystemId|SourceSystemOwner
+METADATA|CandidateAddress|SourceSystemId|SourceSystemOwner|CandidateNumber|AddressLine1|AddressLine2|AddressLine3|AddressLine4|Building|FloorNumber|TownOrCity|Region1|Region2|Region3|Country|PostalCode|EffectiveStartDate|AddressType
 MERGE|CandidateAddress|CAN102|879 Fyxaiba Street|Suite 4253|||||New York|New York|New York|New York|US|10001|2025/10/22|HOME|CAN002_ADDR|TEST
