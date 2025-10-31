@@ -3289,7 +3289,19 @@ async def validate_data(payload: ValidatePayload):
         # After split, ensure passed_df retains original string values for oracle-safe rows.
         # But first ensure passed_df exists (it does)
         # Fill missing EffectiveEndDate in passed_df with oracle default as string BEFORE dtype enforcement
-        if "EffectiveEndDate" in passed_df.columns:
+        if "EffectiveEndDate" and component_name.lower() != "workrelationship"  in passed_df.columns:
+            #if the action code column exists and that row data have termactions then we set the default end date as ""
+            action_code_col = None
+            for col in passed_df.columns:
+                if col.strip().lower() == "actioncode":
+                    action_code_col = col
+            if action_code_col and any(act in term_actions for act in passed_df[action_code_col].astype(str).str.strip().str.upper()):
+                passed_df["EffectiveEndDate"] = passed_df["EffectiveEndDate"].astype("object")
+                passed_df.loc[
+                    (passed_df["EffectiveEndDate"].astype(str).str.strip() == "") & (passed_df[action_code_col].astype(str).str.strip().str.upper().isin(term_actions)),
+                    "EffectiveEndDate"
+                ] = "" 
+        elif "EffectiveEndDate" in passed_df.columns:
             passed_df["EffectiveEndDate"] = passed_df["EffectiveEndDate"].astype("object")
             passed_df.loc[
                 passed_df["EffectiveEndDate"].astype(str).str.strip() == "", "EffectiveEndDate"
