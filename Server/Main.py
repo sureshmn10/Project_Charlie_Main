@@ -1355,79 +1355,94 @@ def get_nlr_rules_batch(
 DIR = Path("uploads/Excel_Files")
 DIR.mkdir(parents=True, exist_ok=True) # Ensure this directory exists at startup
 
-def populate_actual_termination_date_from_resignation(file_path: Path, header_row_num: int = 2, save_as_new_file=False, hireActions: List = [], globalTransfers: List = [], termAction: List = []):
+def populate_actual_termination_date_from_resignation(
+    file_path: Path,
+    header_row_num: int = 2,
+    save_as_new_file: bool = False,
+    hireActions: List[str] = [],
+    globalTransfers: List[str] = [],
+    termAction: List[str] = []
+):
     try:
         wb = openpyxl.load_workbook(file_path)
         ws = wb.active
 
         headers = [cell.value for cell in ws[header_row_num]]
-        logger.info(f"[INFO] Headers: {headers}")
-        combined_hire_glb = hireActions + globalTransfers
+
+        combined_hire_glb = [x.upper() for x in hireActions + globalTransfers]
+        termAction = [x.upper() for x in termAction]
+
         # Ensure ActualTerminationDate exists
         if "ActualTerminationDate" not in headers:
             headers.append("ActualTerminationDate")
             ws.cell(row=header_row_num, column=len(headers)).value = "ActualTerminationDate"
 
-        try:
-            person_idx = headers.index("PersonNumber")
-            action_idx = headers.index("ActionCode")
-            eff_start_idx = headers.index("EffectiveStartDate")
-            actual_term_idx = headers.index("ActualTerminationDate")
-        except ValueError as ve:
-            logger.info("[ERROR] Required headers not found:", ve)
-            return
+        person_idx = headers.index("PersonNumber")
+        action_idx = headers.index("ActionCode")
+        eff_start_idx = headers.index("EffectiveStartDate")
+        actual_term_idx = headers.index("ActualTerminationDate")  # <-- Correct column reference
 
-        # Map of PersonNumber -> all rows (sorted)
+        # Group rows per employee
         person_rows = {}
-
         for i, row in enumerate(ws.iter_rows(min_row=header_row_num+1), start=header_row_num+1):
             person = str(row[person_idx].value).strip() if row[person_idx].value else None
             if not person:
                 continue
-            if person not in person_rows:
-                person_rows[person] = []
-            person_rows[person].append((i, row))
+            person_rows.setdefault(person, []).append((i, row))
 
         for person, rows in person_rows.items():
-            # Sort rows by EffectiveStartDate
-            sorted_rows = sorted(rows, key=lambda r: r[1][eff_start_idx].value)
+            # Sort rows by EffectiveStartDate (ignore infinite dates)
+            def safe_date(r):
+                val = r[1][eff_start_idx].value
+                if isinstance(val, datetime) and val.year >= 4000:  # Oracle Infinite Date
+                    return datetime.max
+                return val or datetime.max
 
-            open_cycle_indices = []
-            cycle_start_idx = None
+            sorted_rows = sorted(rows, key=safe_date)
+
+            open_cycle_start = None
 
             for idx, row in sorted_rows:
                 action = str(row[action_idx].value).strip().upper() if row[action_idx].value else ""
-                date_val = row[eff_start_idx].value
+                eff_date = row[eff_start_idx].value
+                # If no EffectiveStartDate → make ATD blank
+                if eff_date is None:
+                    ws.cell(row=idx, column=actual_term_idx+1).value = None
+                    continue
+
+                # Ignore invalid future boundary date (Oracle infinite)
+                if isinstance(eff_date, datetime) and eff_date.year >= 4000:
+                    ws.cell(row=idx, column=actual_term_idx+1).value = None
+                    continue
 
                 if action in combined_hire_glb:
-                    cycle_start_idx = idx
-                    open_cycle_indices = [idx]  # start fresh
-                elif action in termAction:
-                    if cycle_start_idx:
-                        resignation_date = date_val
-                        termination_date = resignation_date - timedelta(days=1)
+                    open_cycle_start = idx
 
-                        for sub_idx, sub_row in sorted_rows:
-                            if cycle_start_idx <= sub_idx < idx:
-                                ws.cell(row=sub_idx, column=actual_term_idx + 1, value=termination_date)
-                        cycle_start_idx = None  # reset for next cycle
-                elif cycle_start_idx:
-                    open_cycle_indices.append(idx)
+                elif action in termAction and open_cycle_start:
+                    resignation_date = eff_date
+                    termination_date = resignation_date - timedelta(days=1)
 
-        # Save
+                    # Apply termination date only to rows in this cycle
+                    for sub_idx, _ in sorted_rows:
+                        if open_cycle_start <= sub_idx < idx:
+                            ws.cell(row=sub_idx, column=actual_term_idx+1).value = termination_date
+
+                    # Reset after closing cycle
+                    open_cycle_start = None
+
+        # Save output
         if save_as_new_file:
-            out_file = file_path.parent / f"{file_path.stem}.xlsx"
-            wb.save(out_file)
-            logger.info(f"[DONE] ✅ Saved as: {out_file.name}")
-            return out_file
-        else:
-            wb.save(file_path)
-            logger.info("[DONE] ✅ Overwritten the original file.")
-            return file_path
+            new_file = file_path.parent / f"{file_path.stem}_updated.xlsx"
+            wb.save(new_file)
+            return new_file
+
+        wb.save(file_path)
+        return file_path
 
     except Exception as e:
-        logger.info(f"[ERROR] ❌ Something went wrong: {e}")
+        logger.error(f"[ERROR] ❌ {e}")
         return None
+
     
 def parse_excel_date(val):
     if isinstance(val, datetime):
@@ -2666,6 +2681,7 @@ def apply_workrelationship_rules(df: pd.DataFrame,
 
             if term_idx < len(next_term_dates):
                 next_term_date = next_term_dates[term_idx] - pd.Timedelta(days=1)
+                logger.info(f"For PersonNumber {person_number}, Action {action} on {row['EffectiveStartDate'].date()}, next termination is on {next_term_dates[term_idx].date()} -> setting ActualTerminationDate to {next_term_date.date()}")
 
             # Assign ActualTerminationDate
             if next_term_date:
@@ -2899,19 +2915,24 @@ async def validate_data(payload: ValidatePayload):
         logger.info("Started StartDate <= EndDate validation.")
 
         if "StartDate" in df.columns and "EndDate" in df.columns:
-            # Ensure proper datetime format
             df["StartDate"] = pd.to_datetime(df["StartDate"], errors="coerce")
             df["EndDate"] = pd.to_datetime(df["EndDate"], errors="coerce")
 
-            # Find rows where start date is missing or not before end date
-            invalid_mask = df["EndDate"] <= df["StartDate"]
-            if invalid_mask.any():
-                for idx in df[invalid_mask].index:
-                    start = df.at[idx, "StartDate"]
-                    end = df.at[idx, "EndDate"]
-                    existing_reason = df.at[idx, "Reason for Failed"]
-                    reason = f"StartDate ({start.date()}) must be before EndDate ({end.date()})"
-                    df.at[idx, "Reason for Failed"] = f"{existing_reason}; {reason}" if existing_reason else reason
+            for idx, row in df.iterrows():
+                start = row["StartDate"]
+                end = row["EndDate"]
+
+                if pd.isna(start) or pd.isna(end):
+                    continue  
+
+                if end < start:
+                    logger.info(f"Row {idx} failed StartDate <= EndDate validation: {start} > {end}")
+                    reason = f"EndDate ({end.date()}) is before StartDate ({start.date()})"
+                else:
+                    continue 
+
+                existing_reason = df.at[idx, "Reason for Failed"] if "Reason for Failed" in df.columns else ""
+                df.at[idx, "Reason for Failed"] = f"{existing_reason}; {reason}" if existing_reason else reason
 
         logger.info("Completed StartDate <= EffectiveEndDate validation.")
 
@@ -3289,11 +3310,30 @@ async def validate_data(payload: ValidatePayload):
         # After split, ensure passed_df retains original string values for oracle-safe rows.
         # But first ensure passed_df exists (it does)
         # Fill missing EffectiveEndDate in passed_df with oracle default as string BEFORE dtype enforcement
-        if "EffectiveEndDate" and component_name.lower() == "workrelationship"  in passed_df.columns:
-            passed_df["EffectiveEndDate"] = passed_df["EffectiveEndDate"].replace({pd.NaT: "", None: ""})
-            mask_missing_end = passed_df["EffectiveEndDate"].astype(str).str.strip() == ""
-            passed_df.loc[mask_missing_end, "EffectiveEndDate"] = ""
-
+        if "EffectiveEndDate" and component_name.lower() != "workrelationship"  in passed_df.columns:
+            #if the action code column exists and that row data have termactions then we set the default end date as ""
+            action_code_col = None
+            for col in passed_df.columns:
+                if col.strip().lower() == "actioncode":
+                    action_code_col = col
+            if action_code_col and any(act in term_actions for act in passed_df[action_code_col].astype(str).str.strip().str.upper()):
+                passed_df["EffectiveEndDate"] = passed_df["EffectiveEndDate"].astype("object")
+                passed_df.loc[
+                    (passed_df["EffectiveEndDate"].astype(str).str.strip() == "") & (passed_df[action_code_col].astype(str).str.strip().str.upper().isin(term_actions)),
+                    "EffectiveEndDate"
+                ] = "" 
+        elif "EffectiveEndDate" in passed_df.columns:
+            passed_df["EffectiveEndDate"] = passed_df["EffectiveEndDate"].astype("object")
+            passed_df.loc[
+                passed_df["EffectiveEndDate"].astype(str).str.strip() == "", "EffectiveEndDate"
+            ] = "4712/12/31"
+        
+        elif "DateTo" in passed_df.columns:
+            passed_df["DateTo"] = passed_df["DateTo"].astype("object")
+            passed_df.loc[
+                passed_df["DateTo"].astype(str).str.strip() == "", "DateTo"
+            ] = "4712/12/31"
+            
         # Also if EffectiveStartDate blank and StartDate present, fallback
         if "EffectiveStartDate" in passed_df.columns:
             passed_df["EffectiveStartDate"] = passed_df["EffectiveStartDate"].replace({pd.NaT: "", None: ""})
@@ -3434,9 +3474,10 @@ async def validate_data(payload: ValidatePayload):
                     df[col] = df[col].replace(["NaT", "nan", "NaN"], "")
 
                     # Replace blanks with Oracle's max date
-                    df.loc[df[col].str.strip() == "", col] = df[col].apply(
-                        lambda x: "4712/12/31" if x.strip() == "" else x
-                    )
+                    if col == "DateTo" or col == "EndDate" or col == "EffectiveEndDate":
+                        df.loc[df[col].str.strip() == "", col] = df[col].apply(
+                            lambda x: "4712/12/31" if x.strip() == "" else x
+                        )
 
                     # Ensure consistent format
                     df[col] = df[col].apply(
