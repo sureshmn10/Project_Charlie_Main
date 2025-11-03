@@ -165,7 +165,7 @@ def generate_validation_code(validation_rules, existing_code_with_error=None): #
         "- 4712 is a valid year for EffectiveEndDate columns and must be accepted where applicable.",
         "- Always treat empty strings, None, NaN, naT or missing values as invalid where applicable.",
         "- Only for EffectiveEndDate columns, if the value is missing or empty, fill it with '4712/12/31' before validation. Dont make any issue in this it has to be perfectly working.",
-        "- 'NA', 'N/A', 'null', 'Null', 'NULL', 'none', 'None', NaT are also considered missing values or empty values where applicable.", 
+        "- 'NA', 'N/A', 'null', 'Null', 'NULL', 'none', 'None', 'NaT', 'nan' are also considered missing values or empty values where applicable.", 
         "- 'nan' is also considered a missing value or empty value where applicable.",
         "- All validation logic must strictly adhere to the rules provided above.",
         "- They must not deviate, generalize, or infer additional rules beyond what is explicitly stated.",
