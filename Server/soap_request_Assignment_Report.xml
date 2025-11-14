@@ -4,7 +4,7 @@
 <ns1:runReport>
 <ns1:reportRequest>
 <ns1:attributeFormat>csv</ns1:attributeFormat>
-<ns1:reportAbsolutePath>Custom/Human Capital Management/SERP Data Loader Tool/HDL Tool Reports/HDL_Core HR_All Rows of Employee Assignment Report.xdo</ns1:reportAbsolutePath>
+<ns1:reportAbsolutePath>/Custom/Human Capital Management/SERP Data Loader Tool/HDL Tool Reports/Core HR Validation Reports/HDL_Core HR_All Rows of Employee Assignment Report.xdo</ns1:reportAbsolutePath>
 <ns1:sizeOfDataChunkDownload>-1</ns1:sizeOfDataChunkDownload>
 </ns1:reportRequest>
 </ns1:runReport>

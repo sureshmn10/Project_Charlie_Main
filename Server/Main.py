@@ -1,6 +1,7 @@
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request, Body, Query, Form, UploadFile, File, status
+from fastapi import FastAPI, HTTPException, Request, Body, Query, Form, UploadFile, File, status, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+import tempfile
 from typing import Dict, List, Optional, Tuple, Set, Any
 from pathlib import Path
 from pydantic import BaseModel, Json, Field, HttpUrl
@@ -2447,42 +2448,7 @@ def base64_to_dataframe(base64_string: str) -> pd.DataFrame:
         raise HTTPException(status_code=400, detail=f"Error decoding base64 or reading file: {e}")
 
 
-# Pydantic model for individual attribute configuration
-class AttributeConfig(BaseModel):
-    Attributes: str
-    required: bool
-    keyValues: bool
-    LookUp_data: str
-    CodeName: str
-    Data_Transformation: str
-    data_type: str
-    includeInDatFileGeneration: bool
 
-# Pydantic model for lookup data structure
-class LookupItem(BaseModel):
-    CODE_Name: str
-    Value: str
-    Meaning: str
-    Enabled_Flag: str
-    Effective_Date: str
-
-# Pydantic model for the entire validation payload
-class ValidatePayload(BaseModel):
-    pyFileName: Optional[str] = None
-    componentName: str
-    attributes: List[AttributeConfig]
-    allLookups: Dict[str, List[LookupItem]]
-    allMapping: Dict[str, Any] # Assuming mapping can be flexible
-    excelFile: str # Base64 encoded Excel file content
-    globalBoName: Optional[str] = None
-    sourceKeys: Optional[Dict[str, str]] = None # Changed from List[str] to Dict[str, str]
-    datColumnOrder: Optional[List[str]] = None
-    hireActions: Optional[List[str]] = Field(default_factory=list) # Added with default
-    rehireActions: Optional[List[str]] = Field(default_factory=list) # Added with default
-    terminationActions: Optional[List[str]] = Field(default_factory=list) # Added with default
-    globalTransferActions: Optional[List[str]] = Field(default_factory=list) # Added with default
-    customerName: Optional[str] = None # Added customerName
-    InstanceName: Optional[str] = None # Added InstanceName
 
 # Helper function to convert base64 to DataFrame
 def base64_to_dataframe(base64_string: str) -> pd.DataFrame:
@@ -2735,6 +2701,44 @@ def enforce_dtypes(df_to_cast, reference_dtypes):
     return df_to_cast
 
 
+# Pydantic model for individual attribute configuration
+class AttributeConfig(BaseModel):
+    Attributes: str
+    required: bool
+    keyValues: bool
+    LookUp_data: str
+    CodeName: str
+    Data_Transformation: str
+    data_type: str
+    includeInDatFileGeneration: bool
+
+# Pydantic model for lookup data structure
+class LookupItem(BaseModel):
+    CODE_Name: str
+    Value: str
+    Meaning: str
+    Enabled_Flag: str
+    Effective_Date: str
+
+# Pydantic model for the entire validation payload
+class ValidatePayload(BaseModel):
+    pyFileName: Optional[str] = None
+    componentName: str
+    attributes: List[AttributeConfig]
+    allLookups: Dict[str, List[LookupItem]]
+    allMapping: Dict[str, Any] # Assuming mapping can be flexible
+    excelFile: str # Base64 encoded Excel file content
+    globalBoName: Optional[str] = None
+    sourceKeys: Optional[Dict[str, str]] = None # Changed from List[str] to Dict[str, str]
+    datColumnOrder: Optional[List[str]] = None
+    hireActions: Optional[List[str]] = Field(default_factory=list) # Added with default
+    rehireActions: Optional[List[str]] = Field(default_factory=list) # Added with default
+    terminationActions: Optional[List[str]] = Field(default_factory=list) # Added with default
+    globalTransferActions: Optional[List[str]] = Field(default_factory=list) # Added with default
+    customerName: Optional[str] = None # Added customerName
+    InstanceName: Optional[str] = None # Added InstanceName
+    DeltaLoad: bool = False # Added DeltaLoad flag
+
 @app.post("/api/hdl/validate-data")
 async def validate_data(payload: ValidatePayload):
     """
@@ -2753,6 +2757,7 @@ async def validate_data(payload: ValidatePayload):
     rehire_actions = [act.upper().strip() for act in (payload.rehireActions or [])]
     customerName = payload.customerName or "default_customer"
     instanceName = payload.InstanceName or ""
+    delta_load = payload.DeltaLoad 
     # ----------------------------------------------------------
     all_mapping = payload.allMapping
     excel_base64 = payload.excelFile
@@ -2761,10 +2766,7 @@ async def validate_data(payload: ValidatePayload):
     # -----------------------------------------------------------
     # use the setup data endpoint function to get these values for hire_actions, term_actions, gt_actions
     # Ensure these are lists even if None is passed
-    
-    
-    # Parse the JSON content to extract the lists
-    # Fetch setup data if any actions are missing
+
     if not hire_actions or not term_actions or not gt_actions or not rehire_actions:
         logger.info("Fetching missing action lists from setup data.")
         try:
@@ -3534,6 +3536,14 @@ async def validate_data(payload: ValidatePayload):
     except Exception as e:
         logger.exception("An error occurred during data validation.")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during validation: {str(e)}")
+
+
+
+class DeltaLoadPayload(BaseModel):
+    customerName: str
+    instanceName: str
+
+
 
 
 VALIDATION_RESULTS_DIR = "validation_results"
@@ -6045,8 +6055,8 @@ async def MandatoryfieldsLoading(req: mandatoryFieldsReqOracle):
     # Define SOAP save zone path
     soap_save_zone = Path(f"{customerName}/{instanceName}/soap_temp_storage")
     soap_save_zone.mkdir(parents=True, exist_ok=True)  # create dirs if they don't exist
-    LookupData_Directory = Path(f"Required_files/{customerName}_{instanceName}_MandatoryFields.xlsx")
-    LookupData_Directory.parent.mkdir(parents=True, exist_ok=True)
+    Mandatory_field_Directory = Path(f"Required_files/{customerName}_{instanceName}_MandatoryFields.xlsx")
+    Mandatory_field_Directory.parent.mkdir(parents=True, exist_ok=True)
 
     # SOAP service URL
     SOAP_URL = f"{oracle_env}/xmlpserver/services/ExternalReportWSSService?wsdl"
@@ -6084,7 +6094,7 @@ async def MandatoryfieldsLoading(req: mandatoryFieldsReqOracle):
                 f.write(response.text)
             logger.info(f"SOAP request saved at: {saved_file_path}")
 
-            excel_path = parse_soap_response_to_excel(saved_file_path, LookupData_Directory)
+            excel_path = parse_soap_response_to_excel(saved_file_path, Mandatory_field_Directory)
             return {
                 "status": "success",
                 "results": "Mandatory Fields loaded successfully"
@@ -6096,26 +6106,19 @@ async def MandatoryfieldsLoading(req: mandatoryFieldsReqOracle):
         raise HTTPException(status_code=500, detail=f"SOAP call failed: {str(e)}")
 
 # Person report fetching 
-class AssignmentReportReqOracle(BaseModel):
-    customerName: str
-    instanceName: str
-
-
-@app.post("/api/hdl/oracle_fetch/AssignmentReport")
-async def MandatoryfieldsLoading(req: AssignmentReportReqOracle):
-    customerName = req.customerName
-    instanceName = req.instanceName
+# query parameter as customername and instance name 
+@app.get("/api/load/delta_report")
+async def Assignment_Report_Loading(customerName, instanceName):
 
     oracle_env, username, password = [x.strip() for x in load_oracle_credentials(customerName, instanceName)]
     logger.warning(f"oracle credentials are, {oracle_env}, {username}, {password}")
     
     # Define SOAP save zone path
     soap_save_zone = Path(f"{customerName}/{instanceName}/soap_temp_storage")
-    soap_save_zone.mkdir(parents=True, exist_ok=True)  # create dirs if they don't exist
+    soap_save_zone.mkdir(parents=True, exist_ok=True)
     Assignment_report_Directory = Path(f"Required_files/{customerName}_{instanceName}_Assignment_Report.xlsx")
     Assignment_report_Directory.parent.mkdir(parents=True, exist_ok=True)
 
-    # SOAP service URL
     SOAP_URL = f"{oracle_env}/xmlpserver/services/ExternalReportWSSService?wsdl"
 
     headers = {
@@ -6123,44 +6126,56 @@ async def MandatoryfieldsLoading(req: AssignmentReportReqOracle):
         "SOAPAction": "",
     }
 
-    # Read from soap_request.xml
-    with open("soap_request_Assignment_Report.xml", "r", encoding="utf-8") as file:
-        soap_body = file.read().strip()
+    # Read SOAP XML
+    try:
+        with open("soap_request_Assignment_Report.xml", "r", encoding="utf-8") as file:
+            soap_body = file.read().strip()
+    except Exception as e:
+        logger.error(f"Error reading SOAP request XML: {e}")
+        return {
+            "status": "error",
+            "message": f"Failed to read SOAP request XML: {e}",
+            "file_path": None
+        }
 
-    # Save a copy of the SOAP request XML to the soap_save_zone
+    # Save request copy
     try:
         saved_file_path = soap_save_zone / "soap_request_Assignment_Report_saved.xml"
         with open(saved_file_path, "w", encoding="utf-8") as f:
             f.write(soap_body)
-        logger.info(f"SOAP request saved at: {saved_file_path}")
-    except Exception as save_err:
-        logger.error(f"Failed to save SOAP XML: {save_err}")
+    except Exception as e:
+        logger.error(f"Failed to save SOAP request XML: {e}")
 
-    # Now make the actual SOAP call
+    # Make SOAP call
     try:
         async with httpx.AsyncClient(timeout=90) as client:
-            #log everything
-            logger.info(f"Making SOAP request to {SOAP_URL} with user {username}")
+            logger.info(f"Calling SOAP => {SOAP_URL} as {username}")
             response = await client.post(SOAP_URL, data=soap_body, headers=headers, auth=(username, password))
             response.raise_for_status()
-            logger.info(f"SOAP request successful with status code {response.status_code}")
-            # log all the response code as well as content
-            logger.warning(f"Response content: {response.text[:500]}...")  # Log first 500 chars for brevity
-            saved_file_path = soap_save_zone / "soap_response_saved.xml"
-            with open(saved_file_path, "w", encoding="utf-8") as f:
-                f.write(response.text)
-            logger.info(f"SOAP request saved at: {saved_file_path}")
 
-            excel_path = parse_soap_response_to_excel(saved_file_path, LookupData_Directory)
+            # Save SOAP response
+            response_save_path = soap_save_zone / "soap_response_saved.xml"
+            with open(response_save_path, "w", encoding="utf-8") as f:
+                f.write(response.text)
+
+            logger.info(f"SOAP response saved: {response_save_path}")
+
+            # Convert to excel
+            excel_path = parse_soap_response_to_excel(response_save_path, Assignment_report_Directory)
+
             return {
                 "status": "success",
-                "results": "Mandatory Fields loaded successfully"
+                "message": "Assignment report loaded successfully",
+                "file_path": str(excel_path)
             }
-    except httpx.HTTPError as e:
-        logger.error(f"SOAP call failed: {str(e)}")
-        if e.response:
-            logger.error(f"Response content: {e.response.text}")
-        raise HTTPException(status_code=500, detail=f"SOAP call failed: {str(e)}")
+
+    except Exception as e:
+        logger.error(f"SOAP call / parsing failed: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"SOAP call failed: {str(e)}",
+            "file_path": None
+        }
 
 
 def parse_soap_response_to_excel(xml_path: str, output_excel_path: str = "output.xlsx", customerName: str = "", instanceName: str = "") -> str:
@@ -6899,3 +6914,459 @@ async def parse_file(
 
     except Exception as e:
         return JSONResponse(content={"error": f"Failed to parse file: {str(e)}"}, status_code=500)
+
+
+@app.get("/api/hdl/precheck/list")
+async def available_precheck_values():
+    """Fetch available pre-check validation rules from JSON file."""
+    CHECKLIST_FILE = Path("Required_files/precheck_validation_rules.json")
+    try:
+        if not CHECKLIST_FILE.exists():
+            raise HTTPException(status_code=404, detail="Pre-check validation rules file not found")
+
+        with open(CHECKLIST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        return {"preCheckValidations": data}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load pre-check validations: {str(e)}")
+    
+
+
+
+class PrecheckReportRequest(BaseModel):
+    customerName: str
+    instanceName: str
+    componentId: str
+
+
+@app.post("/api/hdl/precheck/reports/fetch/{componentId}")
+async def fetch_precheck_report(componentId: str, req: PrecheckReportRequest):
+
+    customerName = req.customerName.strip()
+    instanceName = req.instanceName.strip()
+
+    CHECKLIST_FILE = Path("Required_files/precheck_validation_rules.json")
+
+    if not CHECKLIST_FILE.exists():
+        raise HTTPException(status_code=404, detail="Precheck JSON not found")
+
+    with open(CHECKLIST_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    component = next(
+        (comp for comp in data.get("Components", []) if comp.get("id") == componentId),
+        None
+    )
+    logger.error(f"component: {component}")
+    component_name = component.get("Name", "Unknown").replace(" ", "_")
+    if not component:
+        raise HTTPException(status_code=404, detail="Component ID not found")
+
+    report_url = component.get("ReportURL")
+    if not report_url:
+        raise HTTPException(status_code=400, detail="Missing ReportURL for component")
+
+    oracle_env, username, password = load_oracle_credentials(customerName, instanceName)
+    logger.warning(f"Using Oracle Credentials: {oracle_env}, {username}, *****")
+
+    SOAP_URL = f"{oracle_env}/xmlpserver/services/PublicReportService"
+
+    # ✅ Save folder
+    save_dir = Path(f"Required_files/precheck_reports/{customerName}/{instanceName}")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    saved_file = save_dir / f"{customerName}_{instanceName}_{component_name}_Precheck_.xlsx"
+
+    soap_body = f"""
+        <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                xmlns:pub="http://xmlns.oracle.com/oxp/service/PublicReportService">
+            <soapenv:Header/>
+            <soapenv:Body>
+                <pub:runReport>
+                    <pub:reportRequest>
+                        <pub:reportAbsolutePath>{report_url}</pub:reportAbsolutePath>
+                        <pub:attributeFormat>xlsx</pub:attributeFormat>
+                        <pub:sizeOfDataChunkDownload>-1</pub:sizeOfDataChunkDownload>
+                        <pub:parameterNameValues>
+                            <pub:item>
+                                <pub:name>P_CUSTOMER_NAME</pub:name>
+                                <pub:values>
+                                    <pub:item>{customerName}</pub:item>
+                                </pub:values>
+                            </pub:item>
+                            <pub:item>
+                                <pub:name>P_INSTANCE_NAME</pub:name>
+                                <pub:values>
+                                    <pub:item>{instanceName}</pub:item>
+                                </pub:values>
+                            </pub:item>
+                        </pub:parameterNameValues>
+                    </pub:reportRequest>
+                    <pub:userID>{username}</pub:userID>
+                    <pub:password>{password}</pub:password>
+                </pub:runReport>
+            </soapenv:Body>
+        </soapenv:Envelope>
+    """
+
+    headers = {
+        "Content-Type": "text/xml;charset=UTF-8",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            logger.info(f"📡 Calling: {SOAP_URL}")
+            resp = await client.post(SOAP_URL, data=soap_body.encode("utf-8"), headers=headers)
+
+        if resp.status_code == 401:
+            logger.error("❌ Unauthorized — Creds Incorrect or Endpoint Secured!")
+            raise HTTPException(status_code=401, detail="Unauthorized Oracle Credentials")
+
+        logger.info(f"✅ Oracle Status: {resp.status_code}")
+
+        # ✅ Parse and extract reportBytes
+        xml_tree = ET.fromstring(resp.text)
+        namespace = {"pub": "http://xmlns.oracle.com/oxp/service/PublicReportService"}
+
+        report_bytes_elem = xml_tree.find(".//pub:reportBytes", namespace)
+        if report_bytes_elem is None:
+            raise HTTPException(status_code=500, detail="Missing reportBytes in response")
+
+        report_bytes = base64.b64decode(report_bytes_elem.text)
+
+        with open(saved_file, "wb") as f:
+            f.write(report_bytes)
+
+        # ✅ Update JSON
+        component["Fetch_Status"] = "Fetched"
+        component["Last Uploaded Excel File Path"] = str(saved_file)
+        component["Last Fetched"] = datetime.now().isoformat()
+
+        with open(CHECKLIST_FILE, "w", encoding="utf-8") as fw:
+            json.dump(data, fw, indent=2)
+
+        return {
+            "success": True,
+            "componentId": componentId,
+            "filePath": str(saved_file),
+            "message": "✅ Excel Report Generated Successfully"
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Fetch Failed: {e}")
+        component["Fetch_Status"] = "Failed"
+        with open(CHECKLIST_FILE, "w", encoding="utf-8") as fw:
+            json.dump(data, fw, indent=2)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+CHECKLIST_FILE = Path("Required_files/precheck_validation_rules.json")
+
+@app.post("/api/hdl/precheck/reports/upload/{id}")
+async def upload_precheck_userdata(
+    id: str,
+    file: UploadFile = File(...),
+    customerName: str = Form(...),
+    instanceName: str = Form(...),
+):
+    # ✅ A little sanitization
+    customerName = customerName.strip()
+    instanceName = instanceName.strip()
+
+    if not CHECKLIST_FILE.exists():
+        raise HTTPException(status_code=404, detail="Precheck JSON not found")
+
+    # ✅ Load JSON
+    with open(CHECKLIST_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    component = next(
+        (comp for comp in data.get("Components", []) if comp.get("id") == id),
+        None
+    )
+
+    if not component:
+        raise HTTPException(status_code=404, detail="Component ID not found")
+
+    # ✅ Create save directory
+    save_dir = Path(f"Required_files/precheck_reports/User_Uploads/{customerName}/{instanceName}/precheck_reports")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # ✅ Filename based on component name
+    comp_name = component.get("Name", "Component").replace(" ", "_")
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    file_path = save_dir / f"{comp_name}_Uploaded_{timestamp}.xlsx"
+
+    # ✅ Save the uploaded file
+    try:
+        content = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(content)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+
+    with open(CHECKLIST_FILE, "w", encoding="utf-8") as fw:
+        json.dump(data, fw, indent=2)
+
+    return {
+        "status": "✅ Success",
+        "componentId": id,
+        "filePath": str(file_path),
+        "message": "Excel uploaded Sucessfully"
+    }
+
+class ValidationRequest(BaseModel):
+    customerName: str
+    instanceName: str
+    componentId: str
+    uploadedFileRef: str | None = None
+
+@app.post("/api/hdl/precheck/reports/validate/{id}")
+async def precheck_validation_global(id: str, payload: ValidationRequest):
+    logger.info("called global validation...")
+    logger.info(f"Validation payload: {payload}")
+
+
+@app.post("/api/excel/sheets")
+async def get_excel_sheets(
+    file: UploadFile = File(...),
+    customerName: str = Form(...),
+    instanceName: str = Form(...)
+):
+    """
+    Upload an Excel file and return:
+      - List of sheet names
+      - Columns from each sheet
+    Also saves the Excel file inside Required_files/Post-Validation_Excels
+    using an iterator (1, 2, 3...) for duplicate uploads.
+    """
+    try:
+        # Read file bytes
+        content = await file.read()
+        filename = file.filename.lower()
+
+        if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
+            return JSONResponse(
+                content={"error": "Unsupported file type. Upload .xlsx or .xls only."},
+                status_code=400,
+            )
+
+        # Read Excel content once
+        excel_file = pd.ExcelFile(io.BytesIO(content))
+        sheet_names = excel_file.sheet_names
+
+        # Extract columns for each sheet
+        columns_dict = {}
+        for sheet in sheet_names:
+            df = excel_file.parse(sheet)
+            columns_dict[sheet] = df.columns.tolist()
+
+        # Prepare save directory
+        save_dir = Path("Required_files/Post-Validation_Excels")
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # File name pattern: Customer_Instance_#.xlsx
+        base_name = f"{customerName}_{instanceName}"
+        existing_files = list(save_dir.glob(f"{base_name}_*.xlsx"))
+
+        # Determine next iterator number
+        next_index = len(existing_files) + 1
+        save_excel_name = f"{base_name}_{next_index}.xlsx"
+        save_path = save_dir / save_excel_name
+
+        # Save the file
+        with open(save_path, "wb") as f:
+            f.write(content)
+
+        # Return structured response
+        return {
+            "sheets": sheet_names,
+            "columns": columns_dict,
+            "saved_as": save_excel_name,
+            "message": "Excel uploaded and processed successfully."
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            content={"error": f"Failed to read Excel file: {str(e)}"},
+            status_code=500,
+        )
+    
+
+
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+
+@app.post("/api/excel/post_validation/validate")
+async def post_validation_excel(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    legacySheet: str = Form(...),
+    oracleSheet: str = Form(...),
+    customerName: str = Form(...),
+    instanceName: str = Form(...),
+    mappings: str = Form(...),
+    uniqueKey: str = Form(...),        # ⭐ NEW — this fixes your join logic
+):
+    """
+    Post-validation endpoint:
+    Compares legacy and oracle sheet rows based on a UNIQUE KEY.
+    Produces:
+        - Legacy Data (rows only in legacy)
+        - Oracle Data (rows only in oracle)
+        - Row Data Validation (mismatches highlighted)
+    """
+
+    temp_dir = tempfile.mkdtemp()
+    input_path = os.path.join(temp_dir, file.filename)
+    output_path = os.path.join(temp_dir, "PostValidation_Report.xlsx")
+
+    try:
+        # Save file
+        with open(input_path, "wb") as f:
+            f.write(await file.read())
+
+        # Parse Mappings
+        try:
+            mappings_dict: Dict[str, str] = json.loads(mappings)
+            if not mappings_dict:
+                raise ValueError("Mappings is empty")
+        except Exception as ex:
+            raise HTTPException(status_code=400, detail=f"Invalid mappings JSON: {ex}")
+
+        # Load Excel
+        excel_data = pd.ExcelFile(input_path)
+        try:
+            legacy_df = pd.read_excel(excel_data, sheet_name=legacySheet)
+            oracle_df = pd.read_excel(excel_data, sheet_name=oracleSheet)
+        except:
+            raise HTTPException(status_code=400, detail="Unable to read provided sheets")
+
+        # Strip headers
+        legacy_df.columns = legacy_df.columns.astype(str).str.strip()
+        oracle_df.columns = oracle_df.columns.astype(str).str.strip()
+
+        # Validate mappings
+        missing = []
+        for l, o in mappings_dict.items():
+            if l not in legacy_df.columns:
+                missing.append(f"Legacy column '{l}' not found")
+            if o not in oracle_df.columns:
+                missing.append(f"Oracle column '{o}' not found")
+        if missing:
+            raise HTTPException(status_code=400, detail={"errors": missing})
+
+        # ⭐ Validate unique key presence
+        if uniqueKey not in legacy_df.columns:
+            raise HTTPException(status_code=400, detail=f"Legacy key '{uniqueKey}' not found")
+
+        if uniqueKey not in oracle_df.columns:
+            raise HTTPException(status_code=400, detail=f"Oracle key '{uniqueKey}' not found")
+
+        # Sort both for deterministic output
+        legacy_df = legacy_df.sort_values(by=uniqueKey).reset_index(drop=True)
+        oracle_df = oracle_df.sort_values(by=uniqueKey).reset_index(drop=True)
+
+        # Identify exclusive rows
+        legacy_only_df = legacy_df[
+            ~legacy_df[uniqueKey].astype(str).isin(oracle_df[uniqueKey].astype(str))
+        ].reset_index(drop=True)
+
+        oracle_only_df = oracle_df[
+            ~oracle_df[uniqueKey].astype(str).isin(legacy_df[uniqueKey].astype(str))
+        ].reset_index(drop=True)
+
+        # Comparison columns
+        legacy_cols = list(mappings_dict.keys())
+        oracle_cols = list(mappings_dict.values())
+
+        legacy_selected = legacy_df[legacy_cols].copy()
+        oracle_selected = oracle_df[oracle_cols].copy()
+        oracle_selected.columns = legacy_cols  # Rename to match legacy
+
+        # ⭐ Merge using the REAL unique key
+        merged_df = pd.merge(
+            legacy_selected,
+            oracle_selected,
+            on=uniqueKey,
+            how="inner",
+            suffixes=("_legacy", "_oracle")
+        )
+
+        # Row comparison
+        mismatch_rows = []
+        for _, row in merged_df.iterrows():
+            mismatch = False
+            combined = {uniqueKey: row[uniqueKey]}
+
+            for col in legacy_cols:
+                if col == uniqueKey:
+                    combined[f"{col} (Legacy)"] = str(row[col])
+                    combined[f"{col} (Oracle)"] = str(row[col])
+                    continue
+
+                l_val = str(row[f"{col}_legacy"] or "").strip()
+                o_val = str(row[f"{col}_oracle"] or "").strip()
+
+                combined[f"{col} (Legacy)"] = l_val
+                combined[f"{col} (Oracle)"] = o_val
+
+                if l_val != o_val:
+                    mismatch = True
+
+            if mismatch:
+                mismatch_rows.append(combined)
+
+        validation_df = (
+            pd.DataFrame(mismatch_rows)
+            if mismatch_rows else
+            pd.DataFrame([{"Status": "All rows matched perfectly"}])
+        )
+
+        # Write Excel Output
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            legacy_only_df.to_excel(writer, index=False, sheet_name="Legacy Data")
+            oracle_only_df.to_excel(writer, index=False, sheet_name="Oracle Data")
+            validation_df.to_excel(writer, index=False, sheet_name="Row Data Validation")
+
+            # Highlight mismatches
+            workbook = writer.book
+            ws = workbook["Row Data Validation"]
+
+            yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+            if "Status" not in validation_df.columns:
+                for r in range(2, ws.max_row + 1):
+                    for c in range(2, ws.max_column + 1, 2):
+                        l_val = str(ws.cell(r, c).value or "").strip()
+                        o_val = str(ws.cell(r, c+1).value or "").strip()
+                        if l_val != o_val:
+                            ws.cell(r, c).fill = yellow
+                            ws.cell(r, c+1).fill = yellow
+
+        # Cleanup temp directory
+        def _clean(path):
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+            except:
+                pass
+
+        background_tasks.add_task(_clean, temp_dir)
+
+        # Return file
+        return FileResponse(
+            output_path,
+            filename="PostValidation_Report.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+          
