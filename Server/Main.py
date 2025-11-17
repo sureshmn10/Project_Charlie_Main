@@ -34,7 +34,7 @@ import shutil
 from pathlib import Path
 import sys
 import importlib.util
-
+import google.generativeai as genai
 
 load_dotenv()
 ORACLE_USERNAME = os.getenv("ORACLE_USERNAME")
@@ -7197,7 +7197,131 @@ async def get_excel_sheets(
             status_code=500,
         )
     
+# Add a dynamic mapping for the sheet columns that are sent in a file with the payload containing the selected sheet tabs it has to dynamically find the columns mapping
+GOOGLE_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyCCFXd3bAAVonA9FAf2kvRlcnt6wKFkaHw')
+genai.configure(api_key=GOOGLE_API_KEY)
 
+def get_smart_mapping_from_gemini(legacy_cols: List[str], oracle_cols: List[str]) -> Dict[str, str]:
+    """
+    Sends column lists to Gemini to generate semantic mappings.
+    Returns a dictionary {legacy_column: oracle_column}.
+    """
+    if not GOOGLE_API_KEY:
+        print("Gemini API Key missing. Returning empty mapping.")
+        return {}
+
+    # NOTE: 'gemini-2.5-flash' does not exist yet. 
+    # Using 'gemini-1.5-flash' which is the current standard for high-speed tasks.
+    # You can switch to 'gemini-2.0-flash-exp' if you have access to the experimental model.
+    model = genai.GenerativeModel(
+        model_name="gemini-2.5-flash",
+        generation_config={"response_mime_type": "application/json"}
+    )
+
+    prompt = f"""
+    Act as a Data Integration Expert. 
+    I have two lists of column headers from different Excel sheets. 
+    
+    1. Legacy System Columns: {json.dumps(legacy_cols)}
+    2. Oracle System Columns: {json.dumps(oracle_cols)}
+
+    Task:
+    Map the 'Legacy System Columns' to the most semantically similar 'Oracle System Column'.
+    
+    Rules:
+    - Return a JSON object where keys are Legacy columns and values are Oracle columns.
+    - Only map columns if you are confident they represent the same data (e.g., "fname" -> "First Name", "amt" -> "Amount").
+    - If a Legacy column has no matching Oracle column, do not include it in the JSON keys.
+    - Output PURE JSON only.
+    """
+
+    try:
+        response = model.generate_content(prompt)
+        
+        # CLEANUP: Even with response_mime_type, models sometimes wrap output in ```json ... ```
+        clean_text = response.text.strip()
+        if clean_text.startswith("```json"):
+            clean_text = clean_text[7:]
+        if clean_text.startswith("```"):
+            clean_text = clean_text[3:]
+        if clean_text.endswith("```"):
+            clean_text = clean_text[:-3]
+            
+        mapping_data = json.loads(clean_text)
+        return mapping_data
+        
+    except json.JSONDecodeError:
+        print(f"Gemini Mapping Error: Invalid JSON received -> {response.text}")
+        return {}
+    except Exception as e:
+        print(f"Gemini AI Mapping Error: {e}")
+        return {}
+
+@app.post("/api/excel/columns/mapping")
+async def get_excel_columns_mapping(
+    file: UploadFile = File(...),
+    legacySheet: str = Form(...),
+    oracleSheet: str = Form(...),
+):
+    """
+    Upload an Excel file and return:
+      - Columns from legacy sheet
+      - Columns from oracle sheet
+      - AI-Generated Semantic mapping of columns
+    """
+    try:
+        # 1. Validate File Type
+        filename = file.filename.lower()
+        if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
+            return JSONResponse(
+                content={"error": "Unsupported file type. Upload .xlsx or .xls only."},
+                status_code=400,
+            )
+
+        # 2. Read File Content
+        content = await file.read()
+        excel_file = pd.ExcelFile(io.BytesIO(content))
+
+        # 3. Extract Columns (Legacy)
+        try:
+            legacy_df = excel_file.parse(legacySheet)
+            legacy_columns = legacy_df.columns.tolist()
+        except Exception:
+            return JSONResponse(
+                content={"error": f"Unable to read legacy sheet: {legacySheet}"},
+                status_code=400,
+            )
+
+        # 4. Extract Columns (Oracle)
+        try:
+            oracle_df = excel_file.parse(oracleSheet)
+            oracle_columns = oracle_df.columns.tolist()
+        except Exception:
+            return JSONResponse(
+                content={"error": f"Unable to read oracle sheet: {oracleSheet}"},
+                status_code=400,
+            )
+
+        # 5. Get Semantic Mapping via Gemini
+        # We pass the lists to the helper function defined above
+        mapping = get_smart_mapping_from_gemini(legacy_columns, oracle_columns)
+
+        # Fallback: If AI fails or returns empty (and you want to ensure exact matches exist)
+        # You can choose to merge exact matches here if you wish, but usually
+        # the AI catches exact matches too.
+        
+        return {
+            "legacy_columns": legacy_columns,
+            "oracle_columns": oracle_columns,
+            "suggested_mapping": mapping,
+            "message": "Columns extracted and mapped successfully using Gemini AI."
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            content={"error": f"Failed to read Excel file: {str(e)}"},
+            status_code=500,
+        )
 
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
@@ -7211,15 +7335,13 @@ async def post_validation_excel(
     customerName: str = Form(...),
     instanceName: str = Form(...),
     mappings: str = Form(...),
-    uniqueKey: str = Form(...),        
+    uniqueKey: str = Form(...),
+    includedColumns: str = Form(default="[]"),
 ):
     """
-    Post-validation endpoint:
-    Compares legacy and oracle sheet rows based on a UNIQUE KEY.
-    Produces:
-        - Legacy Data (rows only in legacy)
-        - Oracle Data (rows only in oracle)
-        - Row Data Validation (mismatches highlighted)
+    Post-validation endpoint.
+    Updates: Only shows columns that actually have mismatches (dynamic column filtering),
+    plus the mandatory included columns.
     """
 
     temp_dir = tempfile.mkdtemp()
@@ -7227,19 +7349,22 @@ async def post_validation_excel(
     output_path = os.path.join(temp_dir, "PostValidation_Report.xlsx")
 
     try:
-        # Save file
+        # --- [Setup: Save file and Parse JSONs] --- 
         with open(input_path, "wb") as f:
             f.write(await file.read())
 
-        # Parse Mappings
         try:
             mappings_dict: Dict[str, str] = json.loads(mappings)
-            if not mappings_dict:
-                raise ValueError("Mappings is empty")
+            if not mappings_dict: raise ValueError("Mappings is empty")
         except Exception as ex:
             raise HTTPException(status_code=400, detail=f"Invalid mappings JSON: {ex}")
 
-        # Load Excel
+        try:
+            included_cols_list: List[str] = json.loads(includedColumns)
+        except Exception as ex:
+            raise HTTPException(status_code=400, detail=f"Invalid includedColumns JSON: {ex}")
+
+        # --- [Load and Preprocess Data] ---
         excel_data = pd.ExcelFile(input_path)
         try:
             legacy_df = pd.read_excel(excel_data, sheet_name=legacySheet)
@@ -7247,71 +7372,74 @@ async def post_validation_excel(
         except:
             raise HTTPException(status_code=400, detail="Unable to read provided sheets")
 
-        # Strip headers
         legacy_df.columns = legacy_df.columns.astype(str).str.strip()
         oracle_df.columns = oracle_df.columns.astype(str).str.strip()
 
-        # Validate mappings
+        # --- [Validation Checks] ---
         missing = []
         for l, o in mappings_dict.items():
-            if l not in legacy_df.columns:
-                missing.append(f"Legacy column '{l}' not found")
-            if o not in oracle_df.columns:
-                missing.append(f"Oracle column '{o}' not found")
+            if l not in legacy_df.columns: missing.append(f"Legacy column '{l}' not found")
+            if o not in oracle_df.columns: missing.append(f"Oracle column '{o}' not found")
+        
+        for col in included_cols_list:
+            if col not in legacy_df.columns: missing.append(f"Included column '{col}' not found")
+
+        if uniqueKey not in legacy_df.columns or uniqueKey not in oracle_df.columns:
+            missing.append(f"Key '{uniqueKey}' missing in one of the sheets")
+
         if missing:
             raise HTTPException(status_code=400, detail={"errors": missing})
 
-        # ⭐ Validate unique key presence
-        if uniqueKey not in legacy_df.columns:
-            raise HTTPException(status_code=400, detail=f"Legacy key '{uniqueKey}' not found")
-
-        if uniqueKey not in oracle_df.columns:
-            raise HTTPException(status_code=400, detail=f"Oracle key '{uniqueKey}' not found")
-
-        # Sort both for deterministic output
+        # --- [Sorting & Exclusive Rows] ---
         legacy_df = legacy_df.sort_values(by=uniqueKey).reset_index(drop=True)
         oracle_df = oracle_df.sort_values(by=uniqueKey).reset_index(drop=True)
 
-        # Identify exclusive rows
-        legacy_only_df = legacy_df[
-            ~legacy_df[uniqueKey].astype(str).isin(oracle_df[uniqueKey].astype(str))
-        ].reset_index(drop=True)
+        legacy_only_df = legacy_df[~legacy_df[uniqueKey].astype(str).isin(oracle_df[uniqueKey].astype(str))].reset_index(drop=True)
+        oracle_only_df = oracle_df[~oracle_df[uniqueKey].astype(str).isin(legacy_df[uniqueKey].astype(str))].reset_index(drop=True)
 
-        oracle_only_df = oracle_df[
-            ~oracle_df[uniqueKey].astype(str).isin(legacy_df[uniqueKey].astype(str))
-        ].reset_index(drop=True)
+        # --- [Merge Preparation] ---
+        legacy_map_keys = list(mappings_dict.keys())
+        oracle_map_values = list(mappings_dict.values())
 
-        # Comparison columns
-        legacy_cols = list(mappings_dict.keys())
-        oracle_cols = list(mappings_dict.values())
+        legacy_cols_to_fetch = list(set([uniqueKey] + included_cols_list + legacy_map_keys))
+        legacy_selected = legacy_df[legacy_cols_to_fetch].copy()
 
-        legacy_selected = legacy_df[legacy_cols].copy()
-        oracle_selected = oracle_df[oracle_cols].copy()
-        oracle_selected.columns = legacy_cols  # Rename to match legacy
+        oracle_cols_to_fetch = list(set(oracle_map_values + [uniqueKey]))
+        oracle_selected = oracle_df[oracle_cols_to_fetch].copy()
 
-        # ⭐ Merge using the REAL unique key
+        reverse_mapping = {v: k for k, v in mappings_dict.items()}
+        oracle_selected = oracle_selected.rename(columns=reverse_mapping)
+
         merged_df = pd.merge(
-            legacy_selected,
-            oracle_selected,
-            on=uniqueKey,
-            how="inner",
-            suffixes=("_legacy", "_oracle")
+            legacy_selected, oracle_selected,
+            on=uniqueKey, how="inner", suffixes=("_legacy", "_oracle")
         )
 
-        # Row comparison
+        # --- [Row Comparison Logic] ---
         mismatch_rows = []
+        
         for _, row in merged_df.iterrows():
             mismatch = False
-            combined = {uniqueKey: row[uniqueKey]}
+            combined = {}
 
-            for col in legacy_cols:
+            # 1. Process Included Columns (Context)
+            for col in included_cols_list:
+                val = row.get(col)
+                if val is None or pd.isna(val):
+                    val = row.get(f"{col}_legacy")
                 if col == uniqueKey:
-                    combined[f"{col} (Legacy)"] = str(row[col])
-                    combined[f"{col} (Oracle)"] = str(row[col])
-                    continue
+                    val = row.get(uniqueKey)
+                combined[col] = str(val or "")
 
-                l_val = str(row[f"{col}_legacy"] or "").strip()
-                o_val = str(row[f"{col}_oracle"] or "").strip()
+            # 2. Process Comparison Columns
+            for col in legacy_map_keys:
+                if col == uniqueKey: continue
+
+                l_val = str(row.get(f"{col}_legacy", "")).strip()
+                if l_val == "nan": l_val = ""
+
+                o_val = str(row.get(f"{col}_oracle", "")).strip()
+                if o_val == "nan": o_val = ""
 
                 combined[f"{col} (Legacy)"] = l_val
                 combined[f"{col} (Oracle)"] = o_val
@@ -7322,43 +7450,76 @@ async def post_validation_excel(
             if mismatch:
                 mismatch_rows.append(combined)
 
-        validation_df = (
-            pd.DataFrame(mismatch_rows)
-            if mismatch_rows else
-            pd.DataFrame([{"Status": "All rows matched perfectly"}])
-        )
+        # Create DataFrame
+        validation_df = pd.DataFrame(mismatch_rows) if mismatch_rows else pd.DataFrame()
 
-        # Write Excel Output
+        # ---------------------------------------------------------
+        # NEW: Filter Columns Logic
+        # If a comparison pair matches perfectly across ALL mismatch rows, drop it.
+        # ---------------------------------------------------------
+        if not validation_df.empty:
+            cols_to_drop = []
+            for col in legacy_map_keys:
+                l_head = f"{col} (Legacy)"
+                o_head = f"{col} (Oracle)"
+                
+                # Only proceed if these columns actually exist in the df
+                if l_head in validation_df.columns and o_head in validation_df.columns:
+                    # Check if the entire column series is identical
+                    if (validation_df[l_head] == validation_df[o_head]).all():
+                        cols_to_drop.extend([l_head, o_head])
+            
+            if cols_to_drop:
+                validation_df.drop(columns=cols_to_drop, inplace=True)
+        
+        # Fallback if everything matched
+        if validation_df.empty and not mismatch_rows:
+             validation_df = pd.DataFrame([{"Status": "All mapped columns matched perfectly"}])
+
+        # --- [Excel Generation] ---
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             legacy_only_df.to_excel(writer, index=False, sheet_name="Legacy Data")
             oracle_only_df.to_excel(writer, index=False, sheet_name="Oracle Data")
             validation_df.to_excel(writer, index=False, sheet_name="Row Data Validation")
 
-            # Highlight mismatches
+            # --- [Highlighting Logic] ---
             workbook = writer.book
             ws = workbook["Row Data Validation"]
-
             yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
+            # Only highlight if we have actual data, not the "Status" message
             if "Status" not in validation_df.columns:
                 for r in range(2, ws.max_row + 1):
-                    for c in range(2, ws.max_column + 1, 2):
-                        l_val = str(ws.cell(r, c).value or "").strip()
-                        o_val = str(ws.cell(r, c+1).value or "").strip()
-                        if l_val != o_val:
-                            ws.cell(r, c).fill = yellow
-                            ws.cell(r, c+1).fill = yellow
+                    # Iterate columns. Note: This automatically adapts to the dropped columns
+                    # because we iterate based on ws.max_column
+                    col_idx = 1
+                    while col_idx < ws.max_column:
+                        header_curr = str(ws.cell(1, col_idx).value or "")
+                        header_next = str(ws.cell(1, col_idx + 1).value or "")
 
-        # Cleanup temp directory
+                        # We look for adjacent Legacy/Oracle pairs
+                        if header_curr.endswith("(Legacy)") and header_next.endswith("(Oracle)"):
+                            l_cell = ws.cell(r, col_idx)
+                            o_cell = ws.cell(r, col_idx + 1)
+
+                            l_val = str(l_cell.value or "").strip()
+                            o_val = str(o_cell.value or "").strip()
+
+                            if l_val != o_val:
+                                l_cell.fill = yellow
+                                o_cell.fill = yellow
+                            
+                            col_idx += 2 # Skip past this pair
+                        else:
+                            col_idx += 1 # Move to next column (likely an Included Column)
+
+        # Cleanup
         def _clean(path):
-            try:
-                shutil.rmtree(path, ignore_errors=True)
-            except:
-                pass
+            try: shutil.rmtree(path, ignore_errors=True)
+            except: pass
 
         background_tasks.add_task(_clean, temp_dir)
 
-        # Return file
         return FileResponse(
             output_path,
             filename="PostValidation_Report.xlsx",
@@ -7368,5 +7529,8 @@ async def post_validation_excel(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-          
+        print(f"Processing Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e)) 
+
+
+
