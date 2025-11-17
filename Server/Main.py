@@ -7340,8 +7340,8 @@ async def post_validation_excel(
 ):
     """
     Post-validation endpoint.
-    Updates: Only shows columns that actually have mismatches (dynamic column filtering),
-    plus the mandatory included columns.
+    Format: Unpivoted (Long)
+    Headers: [UniqueKey] | [Included Cols] | Column Name | Source Value | Target Value
     """
 
     temp_dir = tempfile.mkdtemp()
@@ -7401,12 +7401,14 @@ async def post_validation_excel(
         legacy_map_keys = list(mappings_dict.keys())
         oracle_map_values = list(mappings_dict.values())
 
+        # Fetch columns needed
         legacy_cols_to_fetch = list(set([uniqueKey] + included_cols_list + legacy_map_keys))
         legacy_selected = legacy_df[legacy_cols_to_fetch].copy()
 
         oracle_cols_to_fetch = list(set(oracle_map_values + [uniqueKey]))
         oracle_selected = oracle_df[oracle_cols_to_fetch].copy()
 
+        # Rename Oracle columns to match Legacy keys (for easier merging/comparison)
         reverse_mapping = {v: k for k, v in mappings_dict.items()}
         oracle_selected = oracle_selected.rename(columns=reverse_mapping)
 
@@ -7416,65 +7418,59 @@ async def post_validation_excel(
         )
 
         # --- [Row Comparison Logic] ---
-        mismatch_rows = []
+        validation_rows = []
         
         for _, row in merged_df.iterrows():
-            mismatch = False
-            combined = {}
+            # 1. Build Context (Unique Key + Included Columns)
+            context_data = {}
+            
+            # Add Unique Key first
+            context_data[uniqueKey] = str(row.get(uniqueKey, ""))
 
-            # 1. Process Included Columns (Context)
+            # Add Included Columns
             for col in included_cols_list:
+                if col == uniqueKey: continue 
                 val = row.get(col)
                 if val is None or pd.isna(val):
-                    val = row.get(f"{col}_legacy")
-                if col == uniqueKey:
-                    val = row.get(uniqueKey)
-                combined[col] = str(val or "")
+                    val = row.get(f"{col}_legacy") # Fallback if it was renamed during merge
+                context_data[col] = str(val or "")
 
-            # 2. Process Comparison Columns
-            for col in legacy_map_keys:
-                if col == uniqueKey: continue
+            # 2. Process Mapped Columns for Mismatches
+            for l_col in legacy_map_keys:
+                if l_col == uniqueKey: continue
 
-                l_val = str(row.get(f"{col}_legacy", "")).strip()
+                l_val = str(row.get(f"{l_col}_legacy", "")).strip()
                 if l_val == "nan": l_val = ""
 
-                o_val = str(row.get(f"{col}_oracle", "")).strip()
+                o_val = str(row.get(f"{l_col}_oracle", "")).strip()
                 if o_val == "nan": o_val = ""
 
-                combined[f"{col} (Legacy)"] = l_val
-                combined[f"{col} (Oracle)"] = o_val
-
                 if l_val != o_val:
-                    mismatch = True
+                    # Construct the specific "Legacy - Oracle" header string
+                    oracle_col_name = mappings_dict[l_col]
+                    col_name_str = f"{l_col} (Legacy) - {oracle_col_name} (Oracle)"
 
-            if mismatch:
-                mismatch_rows.append(combined)
+                    error_entry = context_data.copy()
+                    error_entry["Column Name"] = col_name_str
+                    error_entry["Source Value"] = l_val
+                    error_entry["Target Value"] = o_val
+                    
+                    validation_rows.append(error_entry)
 
         # Create DataFrame
-        validation_df = pd.DataFrame(mismatch_rows) if mismatch_rows else pd.DataFrame()
-
-        # ---------------------------------------------------------
-        # NEW: Filter Columns Logic
-        # If a comparison pair matches perfectly across ALL mismatch rows, drop it.
-        # ---------------------------------------------------------
-        if not validation_df.empty:
-            cols_to_drop = []
-            for col in legacy_map_keys:
-                l_head = f"{col} (Legacy)"
-                o_head = f"{col} (Oracle)"
-                
-                # Only proceed if these columns actually exist in the df
-                if l_head in validation_df.columns and o_head in validation_df.columns:
-                    # Check if the entire column series is identical
-                    if (validation_df[l_head] == validation_df[o_head]).all():
-                        cols_to_drop.extend([l_head, o_head])
+        if validation_rows:
+            validation_df = pd.DataFrame(validation_rows)
             
-            if cols_to_drop:
-                validation_df.drop(columns=cols_to_drop, inplace=True)
-        
-        # Fallback if everything matched
-        if validation_df.empty and not mismatch_rows:
-             validation_df = pd.DataFrame([{"Status": "All mapped columns matched perfectly"}])
+            # Define strictly ordered columns
+            # 1. Unique Key
+            # 2. Included Columns
+            # 3. Column Name
+            # 4. Source Value
+            # 5. Target Value
+            ordered_cols = [uniqueKey] + [c for c in included_cols_list if c != uniqueKey] + ["Column Name", "Source Value", "Target Value"]
+            validation_df = validation_df[ordered_cols]
+        else:
+            validation_df = pd.DataFrame([{"Status": "All mapped columns matched perfectly"}])
 
         # --- [Excel Generation] ---
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -7487,31 +7483,23 @@ async def post_validation_excel(
             ws = workbook["Row Data Validation"]
             yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
-            # Only highlight if we have actual data, not the "Status" message
             if "Status" not in validation_df.columns:
-                for r in range(2, ws.max_row + 1):
-                    # Iterate columns. Note: This automatically adapts to the dropped columns
-                    # because we iterate based on ws.max_column
-                    col_idx = 1
-                    while col_idx < ws.max_column:
-                        header_curr = str(ws.cell(1, col_idx).value or "")
-                        header_next = str(ws.cell(1, col_idx + 1).value or "")
+                # Dynamic column finding
+                source_idx = None
+                target_idx = None
 
-                        # We look for adjacent Legacy/Oracle pairs
-                        if header_curr.endswith("(Legacy)") and header_next.endswith("(Oracle)"):
-                            l_cell = ws.cell(r, col_idx)
-                            o_cell = ws.cell(r, col_idx + 1)
+                for col_idx in range(1, ws.max_column + 1):
+                    header = ws.cell(1, col_idx).value
+                    if header == "Source Value":
+                        source_idx = col_idx
+                    elif header == "Target Value":
+                        target_idx = col_idx
 
-                            l_val = str(l_cell.value or "").strip()
-                            o_val = str(o_cell.value or "").strip()
-
-                            if l_val != o_val:
-                                l_cell.fill = yellow
-                                o_cell.fill = yellow
-                            
-                            col_idx += 2 # Skip past this pair
-                        else:
-                            col_idx += 1 # Move to next column (likely an Included Column)
+                # Apply Highlight
+                if source_idx and target_idx:
+                    for r in range(2, ws.max_row + 1):
+                        ws.cell(r, source_idx).fill = yellow
+                        ws.cell(r, target_idx).fill = yellow
 
         # Cleanup
         def _clean(path):
@@ -7530,7 +7518,6 @@ async def post_validation_excel(
         raise
     except Exception as e:
         print(f"Processing Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e)) 
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 
