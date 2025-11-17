@@ -11,3 +11,4 @@ dotenv
 httpx
 ollama
 psutil
+google-generativeai
