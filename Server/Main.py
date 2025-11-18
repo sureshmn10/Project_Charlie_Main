@@ -35,7 +35,10 @@ from pathlib import Path
 import sys
 import importlib.util
 import google.generativeai as genai
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Border, Side, Font, Alignment
+from openpyxl.utils import get_column_letter
+import xml.etree.ElementTree as ET
+
 
 load_dotenv()
 ORACLE_USERNAME = os.getenv("ORACLE_USERNAME")
@@ -2701,8 +2704,160 @@ def enforce_dtypes(df_to_cast, reference_dtypes):
             logger.warning(f"Failed to enforce dtype for column {col}: {e}")
     return df_to_cast
 
+def validate_delta_logic(df, delta_df, hire_actions, term_actions, rehire_actions, gt_actions):
+    """
+    Dynamic Validation:
+    - Checks if PersonNumber exists in Cloud (delta_df).
+    - IF EXISTS (Delta Load = True): Performs Section B (Date continuity, Sequence checks).
+    - IF NOT EXISTS (Delta Load = False): Performs Section A (Hire checks).
+    - Handles case-insensitive column headers by normalizing them to expected canonical names.
+    """
+    logger.info("Starting Dynamic Delta/New Hire Validation...")
 
-# Pydantic model for individual attribute configuration
+    # --- 0. COLUMN NORMALIZATION HELPER ---
+    # Map lowercase versions to the required CamelCase names used in the logic
+    canonical_cols = {
+        "personnumber": "PersonNumber",
+        "effectivestartdate": "EffectiveStartDate",
+        "actioncode": "ActionCode",
+        "effectivesequence": "EffectiveSequence",
+        "assignmentsequence": "AssignmentSequence",
+        "reason for failed": "Reason for Failed"
+    }
+
+    def normalize_columns(dataframe, mapping):
+        """Renames columns to canonical names if they match case-insensitively."""
+        new_columns = {}
+        for col in dataframe.columns:
+            col_str = str(col).strip()
+            col_lower = col_str.lower()
+            # If the lowercase version matches our required list, rename it to the Canonical version
+            if col_lower in mapping:
+                new_columns[col] = mapping[col_lower]
+            else:
+                new_columns[col] = col_str # Just strip whitespace for others
+        return dataframe.rename(columns=new_columns)
+
+    # --- 1. Prepare Cloud Data for fast lookup ---
+    # Normalize delta_df columns to handle 'personnumber', 'Personnumber', etc.
+    delta_df = normalize_columns(delta_df, canonical_cols)
+    
+    if "PersonNumber" not in delta_df.columns:
+        logger.error("Delta/Cloud file is missing 'PersonNumber' (checked case-insensitive). Skipping Delta logic.")
+        return df
+
+    # Convert dates
+    delta_df["EffectiveStartDate"] = pd.to_datetime(delta_df["EffectiveStartDate"], errors='coerce')
+    
+    # Ensure sequences are numeric
+    for col in ["EffectiveSequence", "AssignmentSequence"]:
+        if col in delta_df.columns:
+            delta_df[col] = pd.to_numeric(delta_df[col], errors='coerce').fillna(1)
+
+    # Sort Cloud Data to get the LATEST row for every person
+    sort_cols = ["PersonNumber", "EffectiveStartDate"]
+    if "EffectiveSequence" in delta_df.columns:
+        sort_cols.append("EffectiveSequence")
+
+    delta_df_sorted = delta_df.sort_values(by=sort_cols, ascending=[True, False, False])
+    latest_cloud_records = delta_df_sorted.drop_duplicates(subset=["PersonNumber"], keep="first").set_index("PersonNumber")
+
+    # --- 2. Prepare Input Data ---
+    # Normalize input df columns to handle 'actioncode', 'Actioncode', etc.
+    df = normalize_columns(df, canonical_cols)
+
+    if "PersonNumber" not in df.columns:
+        logger.warning("Input file missing 'PersonNumber' (checked case-insensitive). Skipping Delta logic.")
+        return df
+
+    df["EffectiveStartDate"] = pd.to_datetime(df["EffectiveStartDate"], errors='coerce')
+    
+    # Ensure Reason for Failed column exists
+    if "Reason for Failed" not in df.columns:
+        df["Reason for Failed"] = ""
+    else:
+        df["Reason for Failed"] = df["Reason for Failed"].astype(str)
+
+    # --- 3. Iterate through Input Groups (Per Person) ---
+    grouped = df.sort_values(by=["PersonNumber", "EffectiveStartDate"]).groupby("PersonNumber")
+
+    for person_number, group in grouped:
+        # Determine if Person exists in Cloud
+        is_in_cloud = person_number in latest_cloud_records.index
+        
+        if is_in_cloud:
+            # --- SECTION B: EMPLOYEE EXISTS (DELTA VALIDATION) ---
+            latest_cloud_row = latest_cloud_records.loc[person_number]
+            cloud_latest_date = latest_cloud_row["EffectiveStartDate"]
+            cloud_latest_action = str(latest_cloud_row.get("ActionCode", "")).strip().upper()
+            cloud_latest_asg_seq = latest_cloud_row.get("AssignmentSequence", 1)
+            cloud_latest_eff_seq = latest_cloud_row.get("EffectiveSequence", 1)
+
+            for idx, row in group.iterrows():
+                # Use .get() safely now that we know the canonical column name exists or we default to empty
+                incoming_action = str(row.get("ActionCode", "")).strip().upper()
+                incoming_date = row["EffectiveStartDate"]
+                failure_reasons = []
+
+                # Special Check: If they exist, HIRE must match existing start date (Correction)
+                if incoming_action in hire_actions:
+                    if pd.notna(incoming_date) and pd.notna(cloud_latest_date):
+                        if incoming_date != cloud_latest_date:
+                            failure_reasons.append(f"Delta Error: Person exists. HIRE date ({incoming_date.date()}) must match existing cloud date ({cloud_latest_date.date()})")
+                
+                # Standard Delta Logic (Updates, Rehires, Transfers)
+                else:
+                    if pd.notna(incoming_date) and pd.notna(cloud_latest_date):
+                        if incoming_date < cloud_latest_date:
+                            failure_reasons.append(f"Delta Error: EffectiveStartDate ({incoming_date.date()}) cannot be before latest cloud record ({cloud_latest_date.date()})")
+                        elif incoming_date == cloud_latest_date:
+                            # Same date, different action -> Sequence Check
+                            if incoming_action != cloud_latest_action:
+                                expected_seq = int(cloud_latest_eff_seq) + 1
+                                # Optional: Auto-correct EffectiveSequence here if needed
+                                # df.at[idx, "EffectiveSequence"] = expected_seq
+
+                    # Rehire Validation
+                    if incoming_action in rehire_actions:
+                        if cloud_latest_action not in term_actions:
+                            failure_reasons.append(f"Delta Error: Rehire failed. Current status ({cloud_latest_action}) is not Terminated.")
+                        else:
+                            if "AssignmentSequence" in df.columns:
+                                df.at[idx, "AssignmentSequence"] = int(cloud_latest_asg_seq) + 1
+
+                    # Global Transfer Validation
+                    elif incoming_action in gt_actions:
+                        if cloud_latest_action in term_actions:
+                            failure_reasons.append(f"Delta Error: Transfer failed. Current status is Terminated.")
+                        else:
+                            if "AssignmentSequence" in df.columns:
+                                df.at[idx, "AssignmentSequence"] = int(cloud_latest_asg_seq) + 1
+
+                # Log Failures
+                if failure_reasons:
+                    existing_reason = df.at[idx, "Reason for Failed"]
+                    if existing_reason == "nan": existing_reason = ""
+                    
+                    combined = "; ".join(failure_reasons)
+                    df.at[idx, "Reason for Failed"] = f"{existing_reason}; {combined}" if existing_reason else combined
+
+        else:
+            # --- SECTION A: NEW HIRE (NOT IN CLOUD) ---
+            # Check that the FIRST action (chronologically) is HIRE
+            first_row_idx = group.index[0] 
+            first_action = str(group.loc[first_row_idx, "ActionCode"]).strip().upper() if "ActionCode" in group.columns else ""
+
+            if first_action not in hire_actions:
+                msg = f"New Hire Error: Person {person_number} not found in cloud. First action must be 'HIRE', found '{first_action}'."
+                # Mark all rows for this new person as failed if the start is wrong
+                for idx in group.index:
+                    existing = df.at[idx, "Reason for Failed"]
+                    if existing == "nan": existing = ""
+                    df.at[idx, "Reason for Failed"] = f"{existing}; {msg}" if existing else msg
+
+    logger.info("Completed Dynamic Delta Validation.")
+    return df
+
 class AttributeConfig(BaseModel):
     Attributes: str
     required: bool
@@ -2806,6 +2961,59 @@ async def validate_data(payload: ValidatePayload):
         df.columns = [col.strip() for col in df.columns] # Clean column names
         df = df.fillna("") # Fill NaN values with empty string for consistent validation
 
+    # =========================================================================
+        # 4. DYNAMIC DELTA / NEW HIRE VALIDATION BLOCK (Now correctly placed)
+        # =========================================================================
+        delta_filename = f"{customerName}_{instanceName}_{component_name}_Report.csv"
+        delta_file_path = Path("required_files") / delta_filename
+        
+        delta_df = pd.DataFrame()
+        file_loaded = False
+
+        if delta_file_path.exists():
+            logger.info(f"Found Delta file at: {delta_file_path}")
+            
+            # Robust Load: Try Excel (openpyxl) -> CSV -> Excel (xlrd)
+            if not file_loaded:
+                try:
+                    delta_df = pd.read_excel(delta_file_path, engine='openpyxl')
+                    file_loaded = True
+                    logger.info("Successfully loaded Delta file using openpyxl.")
+                except Exception: pass
+
+            if not file_loaded:
+                try:
+                    delta_df = pd.read_csv(delta_file_path, sep=None, engine='python')
+                    file_loaded = True
+                    logger.info("Successfully loaded Delta file as CSV.")
+                except Exception: pass
+
+            if not file_loaded:
+                    logger.error("CRITICAL: Delta file exists but could not be read. Validation will proceed assuming New Hires.")
+        else:
+                logger.warning(f"Delta file not found at {delta_file_path}. Validation will proceed assuming New Hires.")
+                logger.warning(f"Calling the oracle to fetch report with {customerName} and {instanceName}")
+                Report_Loading(customerName, instanceName, component_name)
+                delta_df = pd.read_excel(delta_file_path, engine='openpyxl')
+                file_loaded = True
+                logger.info("Successfully loaded Delta file using openpyxl after fetching from Oracle.")
+        # Execute Logic if Delta file is loaded
+        if not delta_df.empty:
+                try:
+                    # IMPORTANT: This function MUST be defined globally (outside this function)
+                    df = validate_delta_logic(
+                    df=df, 
+                    delta_df=delta_df,
+                    hire_actions=hire_actions,
+                    term_actions=term_actions,
+                    rehire_actions=rehire_actions,
+                    gt_actions=gt_actions
+                )
+                except Exception as logic_err:
+                    logger.error(f"Error executing Delta Logic: {logic_err}", exc_info=True)
+        # =========================================================================
+        # END DELTA BLOCK
+        # =========================================================================
         # Get the original columns from the uploaded Excel (before any additions like sourceKeys)
         original_excel_columns = df.columns.tolist()
 
@@ -6109,86 +6317,141 @@ async def MandatoryfieldsLoading(req: mandatoryFieldsReqOracle):
 # Person report fetching 
 # query parameter as customername and instance name 
 @app.get("/api/load/delta_report")
-async def Assignment_Report_Loading(customerName, instanceName):
-
-    oracle_env, username, password = [x.strip() for x in load_oracle_credentials(customerName, instanceName)]
-    logger.warning(f"oracle credentials are, {oracle_env}, {username}, {password}")
+async def Report_Loading(customerName: str, instanceName: str, componentName: str):
     
-    # Define SOAP save zone path
+    # Load credentials
+    try:
+        oracle_env, username, password = [x.strip() for x in load_oracle_credentials(customerName, instanceName)]
+    except Exception as e:
+        logger.error(f"Credential load error: {e}")
+        return {"status": "error", "message": "Failed to load Oracle credentials"}
+
+    # Define Paths
     soap_save_zone = Path(f"{customerName}/{instanceName}/soap_temp_storage")
     soap_save_zone.mkdir(parents=True, exist_ok=True)
-    Assignment_report_Directory = Path(f"Required_files/{customerName}_{instanceName}_Assignment_Report.xlsx")
+    
+    # CORRECTED: Changed extension from .xlsx to .csv to match the parser output
+    Assignment_report_Directory = Path(f"required_files/{customerName}_{instanceName}_{componentName}_Report.csv")
     Assignment_report_Directory.parent.mkdir(parents=True, exist_ok=True)
 
     SOAP_URL = f"{oracle_env}/xmlpserver/services/ExternalReportWSSService?wsdl"
 
     headers = {
         "Content-Type": "application/soap+xml; charset=utf-8",
-        "SOAPAction": "",
     }
 
-    # Read SOAP XML
+    # Read SOAP XML Template
+    soap_template_path = Path(f"soap_request_{componentName}_Report.xml")
+    if not soap_template_path.exists():
+        return {"status": "error", "message": f"SOAP Request Template 'soap_request_{componentName}_Report.xml' not found."}
+
     try:
-        with open("soap_request_Assignment_Report.xml", "r", encoding="utf-8") as file:
+        with open(soap_template_path, "r", encoding="utf-8") as file:
             soap_body = file.read().strip()
     except Exception as e:
-        logger.error(f"Error reading SOAP request XML: {e}")
-        return {
-            "status": "error",
-            "message": f"Failed to read SOAP request XML: {e}",
-            "file_path": None
-        }
-
-    # Save request copy
-    try:
-        saved_file_path = soap_save_zone / "soap_request_Assignment_Report_saved.xml"
-        with open(saved_file_path, "w", encoding="utf-8") as f:
-            f.write(soap_body)
-    except Exception as e:
-        logger.error(f"Failed to save SOAP request XML: {e}")
+        return {"status": "error", "message": f"Failed to read SOAP template: {e}"}
 
     # Make SOAP call
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            logger.info(f"Calling SOAP => {SOAP_URL} as {username}")
-            response = await client.post(SOAP_URL, data=soap_body, headers=headers, auth=(username, password))
-            response.raise_for_status()
+        async with httpx.AsyncClient(timeout=120) as client: # Increased timeout for reports
+            logger.info(f"Fetching Delta Report from: {SOAP_URL}")
+            
+            response = await client.post(
+                SOAP_URL, 
+                data=soap_body, 
+                headers=headers, 
+                auth=(username, password)
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"SOAP Failed: {response.status_code} - {response.text}")
+                return {"status": "error", "message": f"Oracle Error: {response.status_code}"}
 
-            # Save SOAP response
-            response_save_path = soap_save_zone / "soap_response_saved.xml"
+            # Save Raw SOAP response (for debugging)
+            response_save_path = soap_save_zone / "soap_response_raw.xml"
             with open(response_save_path, "w", encoding="utf-8") as f:
                 f.write(response.text)
 
-            logger.info(f"SOAP response saved: {response_save_path}")
-
-            # Convert to excel
-            excel_path = parse_soap_response_to_excel(response_save_path, Assignment_report_Directory)
+            # --- CRITICAL STEP ---
+            # Parse the XML, extract Base64, decode, and save as CLEAN CSV
+            # The parser now ensures the file at Assignment_report_Directory is a valid CSV
+            final_path = parse_soap_response_to_csv(str(response_save_path), str(Assignment_report_Directory))
 
             return {
                 "status": "success",
-                "message": "Assignment report loaded successfully",
-                "file_path": str(excel_path)
+                "message": "Assignment report loaded and converted successfully",
+                "file_path": str(final_path)
             }
 
     except Exception as e:
-        logger.error(f"SOAP call / parsing failed: {str(e)}")
+        logger.exception("Error in Delta Report Loading Endpoint")
         return {
             "status": "error",
-            "message": f"SOAP call failed: {str(e)}",
+            "message": f"Processing failed: {str(e)}",
             "file_path": None
         }
-
-
 def parse_soap_response_to_excel(xml_path: str, output_excel_path: str = "output.xlsx", customerName: str = "", instanceName: str = "") -> str:
     """
-    Parses SOAP response XML and saves embedded base64 Excel data as a file.
-    
-    Args:
-        xml_path (str): Path to the response XML file.
-        output_excel_path (str): Path to save the decoded Excel file.
-    
-    Returns:
-        str: Path of the saved Excel file.
+    Parses SOAP response XML, extracts embedded base64 data, 
+    CONVERTS it (from CSV or Excel) to a valid .xlsx structure, and saves it.
+    """
+    ns = {
+        'env': 'http://www.w3.org/2003/05/soap-envelope',
+        'ns2': 'http://xmlns.oracle.com/oxp/service/PublicReportService'
+    }
+
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+
+        # Navigate to the reportBytes element
+        # Using .// to find it anywhere in the structure to be safe
+        report_bytes_elem = root.find('.//ns2:reportBytes', ns)
+        
+        if report_bytes_elem is None or not report_bytes_elem.text:
+            raise ValueError("reportBytes not found or empty in the response.")
+
+        # Decode base64 content
+        decoded_bytes = base64.b64decode(report_bytes_elem.text)
+
+        # --- CRITICAL FIX START ---
+        # Do not just write bytes. Read them into Pandas to standardize format.
+        df = None
+        
+        # Attempt 1: Try reading as CSV (most likely format for data integration)
+        try:
+            df = pd.read_csv(io.BytesIO(decoded_bytes))
+            logger.info("SOAP content identified as CSV. Converting to Excel...")
+        except Exception:
+            # Attempt 2: Try reading as Excel (if Oracle actually returned a binary xls/xlsx)
+            try:
+                df = pd.read_excel(io.BytesIO(decoded_bytes))
+                logger.info("SOAP content identified as valid Excel.")
+            except Exception as e:
+                # If both fail, the data is likely corrupt or HTML
+                raise ValueError(f"Decoded data is neither valid CSV nor Excel. First 50 chars: {decoded_bytes[:50]}")
+
+        # Save as a guaranteed clean Excel file using openpyxl engine
+        output_path = Path(output_excel_path)
+        
+        # Ensure parent directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        df.to_excel(output_path, index=False, engine='openpyxl')
+        # --- CRITICAL FIX END ---
+
+        logger.info(f"Assignment report successfully saved to: {output_path}")
+        return str(output_path.resolve())
+
+    except Exception as e:
+        logger.error(f"Failed to extract/convert Excel from SOAP XML: {e}")
+        raise RuntimeError(f"Failed to extract Excel from SOAP XML: {e}")
+
+
+def parse_soap_response_to_csv(xml_path: str, output_csv_path: str = "output.csv", customerName: str = "", instanceName: str = "") -> str:
+    """
+    Parses SOAP response XML, extracts embedded base64 data, 
+    validates it, and saves it as a CLEAN CSV file.
     """
     ns = {
         'env': 'http://www.w3.org/2003/05/soap-envelope',
@@ -6201,20 +6464,45 @@ def parse_soap_response_to_excel(xml_path: str, output_excel_path: str = "output
 
         # Navigate to the reportBytes element
         report_bytes_elem = root.find('.//ns2:reportBytes', ns)
+        
         if report_bytes_elem is None or not report_bytes_elem.text:
             raise ValueError("reportBytes not found or empty in the response.")
 
         # Decode base64 content
-        decoded_excel = base64.b64decode(report_bytes_elem.text)
+        decoded_bytes = base64.b64decode(report_bytes_elem.text)
 
-        # Save as Excel file
-        output_path = Path(output_excel_path)
-        output_path.write_bytes(decoded_excel)
+        # --- LOAD DATA (Validation & Standardization) ---
+        df = None
+        
+        # Attempt 1: Try reading as CSV (Standardize format)
+        try:
+            df = pd.read_csv(io.BytesIO(decoded_bytes))
+            logger.info("SOAP content identified as CSV.")
+        except Exception:
+            # Attempt 2: Try reading as Excel (In case report was actually xlsx)
+            try:
+                df = pd.read_excel(io.BytesIO(decoded_bytes))
+                logger.info("SOAP content identified as Excel. Converting to CSV...")
+            except Exception as e:
+                raise ValueError(f"Decoded data is neither valid CSV nor Excel. First 50 chars: {decoded_bytes[:50]}")
 
+        # --- SAVE AS CSV ---
+        output_path = Path(output_csv_path)
+        
+        # Ensure parent directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Write to CSV 
+        # index=False removes the pandas row numbers
+        # encoding='utf-8-sig' ensures special characters work in Excel if opened manually later
+        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+
+        logger.info(f"Assignment report successfully saved to: {output_path}")
         return str(output_path.resolve())
 
     except Exception as e:
-        raise RuntimeError(f"Failed to extract Excel from SOAP XML: {e}")
+        logger.error(f"Failed to extract/save CSV from SOAP XML: {e}")
+        raise RuntimeError(f"Failed to extract CSV from SOAP XML: {e}")
 
 
 @app.get("/api/lookupdata/available")
@@ -7325,20 +7613,21 @@ async def post_validation_excel(
     customerName: str = Form(...),
     instanceName: str = Form(...),
     mappings: str = Form(...),
-    keyColumns: str = Form(...),  
+    keyColumns: str = Form(...),
     includedColumns: str = Form(default="[]"),
+    userID: str = Form(default="System"),
     # Compatibility args
     legacySheet: str = Form(default=""),
     oracleSheet: str = Form(default=""),
 ):
     """
     Post-validation endpoint.
-    Accepts two separate files, performs validation based on mappings and keys.
+    Generates a multi-sheet Excel report including a styled Summary.
     """
 
     temp_dir = tempfile.mkdtemp()
     output_path = os.path.join(temp_dir, "PostValidation_Report.xlsx")
-    
+
     INTERNAL_KEY = "_derived_key"
 
     try:
@@ -7353,7 +7642,7 @@ async def post_validation_excel(
             included_cols_list: List[str] = json.loads(includedColumns)
         except Exception as ex:
             raise HTTPException(status_code=400, detail=f"Invalid includedColumns JSON: {ex}")
-            
+
         try:
             key_cols_list: List[str] = json.loads(keyColumns)
             if not key_cols_list: raise ValueError("Key columns list is empty")
@@ -7377,12 +7666,12 @@ async def post_validation_excel(
 
         # --- [Validation Checks] ---
         missing = []
-        
+
         # Check Mappings
         for l, o in mappings_dict.items():
             if l not in legacy_df.columns: missing.append(f"Legacy column '{l}' not found")
             if o not in oracle_df.columns: missing.append(f"Oracle column '{o}' not found")
-        
+
         # Check Included Columns
         for col in included_cols_list:
             if col not in legacy_df.columns: missing.append(f"Included column '{col}' not found")
@@ -7391,7 +7680,7 @@ async def post_validation_excel(
         for k_col in key_cols_list:
             if k_col not in legacy_df.columns:
                 missing.append(f"Key column '{k_col}' missing in Legacy sheet")
-            
+
             o_key_col = mappings_dict.get(k_col, k_col)
             if o_key_col not in oracle_df.columns:
                  missing.append(f"Key column '{o_key_col}' missing in Oracle sheet")
@@ -7406,7 +7695,7 @@ async def post_validation_excel(
         # Legacy Key Generation
         legacy_df[INTERNAL_KEY] = generate_key(legacy_df, key_cols_list)
 
-        # Oracle Key Generation (Map column names first)
+        # Oracle Key Generation
         oracle_key_cols = [mappings_dict.get(k, k) for k in key_cols_list]
         oracle_df[INTERNAL_KEY] = generate_key(oracle_df, oracle_key_cols)
 
@@ -7421,7 +7710,6 @@ async def post_validation_excel(
         legacy_map_keys = list(mappings_dict.keys())
         oracle_map_values = list(mappings_dict.values())
 
-        # Include Keys + Included + Mapped + Internal Key
         legacy_cols_to_fetch = list(set(key_cols_list + included_cols_list + legacy_map_keys + [INTERNAL_KEY]))
         legacy_selected = legacy_df[legacy_cols_to_fetch].copy()
 
@@ -7438,86 +7726,205 @@ async def post_validation_excel(
 
         # --- [Row Comparison Logic] ---
         validation_rows = []
-        
+
         for _, row in merged_df.iterrows():
             context_data = {}
-            
-            # Add Key Columns (as Context)
             for k_col in key_cols_list:
                 val = row.get(k_col)
-                if val is None or pd.isna(val):
-                     val = row.get(f"{k_col}_legacy")
+                if val is None or pd.isna(val): val = row.get(f"{k_col}_legacy")
                 context_data[k_col] = str(val or "")
 
-            # Add Included Columns
             for col in included_cols_list:
-                if col in key_cols_list: continue 
+                if col in key_cols_list: continue
                 val = row.get(col)
-                if val is None or pd.isna(val):
-                    val = row.get(f"{col}_legacy")
+                if val is None or pd.isna(val): val = row.get(f"{col}_legacy")
                 context_data[col] = str(val or "")
 
-            # Process Mapped Columns
             for l_col in legacy_map_keys:
                 if l_col in key_cols_list: continue
-
                 l_val = str(row.get(f"{l_col}_legacy", "")).strip()
                 if l_val == "nan": l_val = ""
-
                 o_val = str(row.get(f"{l_col}_oracle", "")).strip()
                 if o_val == "nan": o_val = ""
 
                 if l_val != o_val:
                     oracle_col_name = mappings_dict[l_col]
-                    col_name_str = f"{l_col} (Legacy) - {oracle_col_name} (Oracle)"
-
+                    col_name_str = f"{l_col} - {oracle_col_name}"
                     error_entry = context_data.copy()
                     error_entry["Column Name"] = col_name_str
                     error_entry["Source Value"] = l_val
                     error_entry["Target Value"] = o_val
-                    
                     validation_rows.append(error_entry)
 
-        # Create DataFrame
         if validation_rows:
             validation_df = pd.DataFrame(validation_rows)
             ordered_cols = key_cols_list + [c for c in included_cols_list if c not in key_cols_list] + ["Column Name", "Source Value", "Target Value"]
-            # Filter columns to ensure they exist
             final_cols = [c for c in ordered_cols if c in validation_df.columns]
             validation_df = validation_df[final_cols]
         else:
             validation_df = pd.DataFrame([{"Status": "All mapped columns matched perfectly"}])
 
         # --- [Remove Internal Key] ---
-        if INTERNAL_KEY in legacy_only_df.columns:
-            legacy_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
-        if INTERNAL_KEY in oracle_only_df.columns:
-            oracle_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
+        if INTERNAL_KEY in legacy_only_df.columns: legacy_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
+        if INTERNAL_KEY in oracle_only_df.columns: oracle_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
 
-        # --- [Excel Generation] ---
+        # --- [Generate Summary Data] ---
+        summary_rows = []
+        total_discrepancies = 0
+        if "Status" not in validation_df.columns:
+            total_discrepancies = len(validation_df)
+
+        # Adding spacer rows and data
+        # Structure: [Spacer, Label, Value] -> Corresponding to Excel Columns A, B, C
+        summary_rows.append(["", "", ""]) 
+        summary_rows.append(["", "Source File Name", legacyFile.filename])
+        summary_rows.append(["", "Source Records Count", len(legacy_df)])
+        summary_rows.append(["", "Target File Name", oracleFile.filename])
+        summary_rows.append(["", "Target Records Count", len(oracle_df)])
+        summary_rows.append(["", "UserID", userID])
+        summary_rows.append(["", "Validation DateTime", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+        summary_rows.append(["", "", ""]) 
+        summary_rows.append(["", "", ""]) 
+        summary_rows.append(["", "Validation Summary", ""])
+        summary_rows.append(["", "Records Missing in Source File", len(legacy_only_df)])
+        summary_rows.append(["", "Records Missing in Target File", len(oracle_only_df)])
+        summary_rows.append(["", "Data Discrepancies", total_discrepancies])
+
+        if total_discrepancies > 0 and "Column Name" in validation_df.columns:
+            breakdown = validation_df["Column Name"].value_counts()
+            for col_name, count in breakdown.items():
+                summary_rows.append(["", col_name, count])
+
+        summary_df = pd.DataFrame(summary_rows)
+
+        # --- [Excel Generation & Styling] ---
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            legacy_only_df.to_excel(writer, index=False, sheet_name="Legacy Data")
-            oracle_only_df.to_excel(writer, index=False, sheet_name="Oracle Data")
-            validation_df.to_excel(writer, index=False, sheet_name="Row Data Validation")
+            # Write Data
+            summary_df.to_excel(writer, index=False, header=False, sheet_name="Summary")
+            legacy_only_df.to_excel(writer, index=False, sheet_name="Records Missing in Source File")
+            oracle_only_df.to_excel(writer, index=False, sheet_name="Records Missing in Target File")
+            validation_df.to_excel(writer, index=False, sheet_name="Data Discrepancies")
 
-            # Highlight Yellow
             workbook = writer.book
-            ws = workbook["Row Data Validation"]
-            yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+            
+            # --- Define Styles ---
+            # Fonts: Calibri 9px (size=9)
+            font_main = Font(name='Calibri', size=9)
+            font_white = Font(name='Calibri', size=9, color="FFFFFF")
+            font_bold_white = Font(name='Calibri', size=9, color="FFFFFF", bold=True)
+            
+            # Fills
+            fill_green = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
+            
+            # Header Fills
+            fill_source_header = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
+            fill_target_header = PatternFill(start_color="31869B", end_color="31869B", fill_type="solid")
+            fill_disc_header = PatternFill(start_color="C0504D", end_color="C0504D", fill_type="solid")
+            
+            # Changed fill_yellow to the new color #FFFFCC
+            fill_discrepancy_highlight = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
 
+            # Borders & Alignment
+            thin_border = Border(
+                left=Side(style='thin'), right=Side(style='thin'),
+                top=Side(style='thin'), bottom=Side(style='thin')
+            )
+            center_align = Alignment(horizontal="center", vertical="center")
+            left_align = Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+            # --- 1. Global: Font, Auto-Size Columns, and Alignment ---
+            # This iterates all sheets and all columns to set default width and alignment
+            for sheet in workbook.worksheets:
+                for col_idx, column_cells in enumerate(sheet.columns, 1):
+                    max_length = 0
+                    col_letter = get_column_letter(col_idx)
+                    
+                    for cell in column_cells:
+                        # Apply Global Font & Alignment
+                        cell.font = font_main
+                        cell.alignment = left_align
+                        
+                        # Calculate Max Length
+                        try:
+                            if cell.value:
+                                length = len(str(cell.value))
+                                if length > max_length:
+                                    max_length = length
+                        except:
+                            pass
+                    
+                    # Set Width (Approximate padding)
+                    adjusted_width = (max_length + 2) * 1.2
+                    # Limit max width to prevent gigantic columns
+                    if adjusted_width > 100: adjusted_width = 100
+                    # Minimum width ensures it's readable
+                    if adjusted_width < 10: adjusted_width = 10
+                    
+                    sheet.column_dimensions[col_letter].width = adjusted_width
+
+            # --- 2. Specific Sheet Header Styling ---
+            def style_header(sheet_name, fill_color):
+                if sheet_name in workbook.sheetnames:
+                    ws = workbook[sheet_name]
+                    for cell in ws[1]:
+                        cell.fill = fill_color
+                        # Apply Bold White Font for Headers
+                        cell.font = font_bold_white
+                        # Headers can remain left aligned as per Global, 
+                        # or explicitly change here if Center is preferred later.
+
+            # Apply specific colors and BOLD font to headers
+            style_header("Records Missing in Source File", fill_source_header)
+            style_header("Records Missing in Target File", fill_target_header)
+            style_header("Data Discrepancies", fill_disc_header)
+
+            # --- 3. Summary Sheet Styling ---
+            ws_sum = workbook["Summary"]
+            ws_sum.sheet_view.showGridLines = False  # Hide gridlines
+            
+            for row in ws_sum.iter_rows(min_row=1, max_row=ws_sum.max_row, min_col=2, max_col=3):
+                label_cell = row[0] # Column B
+                value_cell = row[1] # Column C
+
+                if label_cell.value:
+                    # Apply Green Background
+                    label_cell.fill = fill_green
+                    
+                    # Apply Borders
+                    label_cell.border = thin_border
+                    value_cell.border = thin_border
+
+                    # Merge & Center for "Validation Summary"
+                    if label_cell.value == "Validation Summary":
+                        ws_sum.merge_cells(start_row=label_cell.row, start_column=2, end_row=label_cell.row, end_column=3)
+                        # This OVERRIDES the global left alignment
+                        label_cell.alignment = center_align
+                        # Apply Bold White Font specifically here
+                        label_cell.font = font_bold_white
+                    else:
+                        # Apply standard White Font (non-bold) for other labels
+                        label_cell.font = font_white
+                        
+                        # Center Align Numbers
+                        if isinstance(value_cell.value, (int, float)):
+                            value_cell.alignment = center_align
+
+            # --- 4. Style Data Discrepancies (Yellow Highlights) ---
+            ws_disc = workbook["Data Discrepancies"]
             if "Status" not in validation_df.columns:
                 source_idx = None
                 target_idx = None
-
-                for col_idx in range(1, ws.max_column + 1):
-                    header = ws.cell(1, col_idx).value
-                    if header == "Source Value": source_idx = col_idx
-                    elif header == "Target Value": target_idx = col_idx
+                # Find indices (1-based)
+                for col_idx in range(1, ws_disc.max_column + 1):
+                    header_val = ws_disc.cell(1, col_idx).value
+                    if header_val == "Source Value": source_idx = col_idx
+                    elif header_val == "Target Value": target_idx = col_idx
 
                 if source_idx and target_idx:
-                    for r in range(2, ws.max_row + 1):
-                        ws.cell(r, source_idx).fill = yellow
-                        ws.cell(r, target_idx).fill = yellow
+                    for r in range(2, ws_disc.max_row + 1):
+                        # Apply new discrepancy highlight color
+                        ws_disc.cell(r, source_idx).fill = fill_discrepancy_highlight
+                        ws_disc.cell(r, target_idx).fill = fill_discrepancy_highlight
 
         # Cleanup
         def _clean(path):
@@ -7525,10 +7932,12 @@ async def post_validation_excel(
             except: pass
 
         background_tasks.add_task(_clean, temp_dir)
+        timestamp = datetime.now().strftime("%m%d%Y %H%M%S")
+        report_filename = f"Post Upload Validation Report_{timestamp}.xlsx"
 
         return FileResponse(
             output_path,
-            filename="PostValidation_Report.xlsx",
+            filename=report_filename,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
@@ -7537,4 +7946,5 @@ async def post_validation_excel(
     except Exception as e:
         print(f"Processing Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
