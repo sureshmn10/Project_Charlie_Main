@@ -2706,154 +2706,212 @@ def enforce_dtypes(df_to_cast, reference_dtypes):
 
 def validate_delta_logic(df, delta_df, hire_actions, term_actions, rehire_actions, gt_actions):
     """
-    Dynamic Validation:
+    Dynamic Validation for Assignment Component:
     - Checks if PersonNumber exists in Cloud (delta_df).
     - IF EXISTS (Delta Load = True): Performs Section B (Date continuity, Sequence checks).
     - IF NOT EXISTS (Delta Load = False): Performs Section A (Hire checks).
-    - Handles case-insensitive column headers by normalizing them to expected canonical names.
     """
     logger.info("Starting Dynamic Delta/New Hire Validation...")
 
     # --- 0. COLUMN NORMALIZATION HELPER ---
-    # Map lowercase versions to the required CamelCase names used in the logic
     canonical_cols = {
         "personnumber": "PersonNumber",
         "effectivestartdate": "EffectiveStartDate",
+        "effectiveenddate": "EffectiveEndDate",
         "actioncode": "ActionCode",
         "effectivesequence": "EffectiveSequence",
         "assignmentsequence": "AssignmentSequence",
-        "reason for failed": "Reason for Failed"
+        "reason for failed": "Reason for Failed",
+        "legalemployername": "LegalEmployerName",
+        "assignmentstatustypecode": "AssignmentStatusTypeCode",
+        "businessunitshortcode": "BusinessUnitShortCode"
     }
 
     def normalize_columns(dataframe, mapping):
-        """Renames columns to canonical names if they match case-insensitively."""
         new_columns = {}
         for col in dataframe.columns:
             col_str = str(col).strip()
+            # Handle BOM if present in the string itself
+            col_str = col_str.replace('\ufeff', '')
             col_lower = col_str.lower()
-            # If the lowercase version matches our required list, rename it to the Canonical version
             if col_lower in mapping:
                 new_columns[col] = mapping[col_lower]
             else:
-                new_columns[col] = col_str # Just strip whitespace for others
+                new_columns[col] = col_str
         return dataframe.rename(columns=new_columns)
 
-    # --- 1. Prepare Cloud Data for fast lookup ---
-    # Normalize delta_df columns to handle 'personnumber', 'Personnumber', etc.
+    # --- 1. Prepare Cloud Data ---
     delta_df = normalize_columns(delta_df, canonical_cols)
     
     if "PersonNumber" not in delta_df.columns:
-        logger.error("Delta/Cloud file is missing 'PersonNumber' (checked case-insensitive). Skipping Delta logic.")
+        logger.error("Delta/Cloud file is missing 'PersonNumber' after normalization. Skipping Delta logic.")
         return df
 
-    # Convert dates
     delta_df["EffectiveStartDate"] = pd.to_datetime(delta_df["EffectiveStartDate"], errors='coerce')
+    delta_df["PersonNumber"] = delta_df["PersonNumber"].astype(str).str.strip()
     
-    # Ensure sequences are numeric
+    # numeric sequences
     for col in ["EffectiveSequence", "AssignmentSequence"]:
         if col in delta_df.columns:
             delta_df[col] = pd.to_numeric(delta_df[col], errors='coerce').fillna(1)
 
-    # Sort Cloud Data to get the LATEST row for every person
+    # Sort to get LATEST row
     sort_cols = ["PersonNumber", "EffectiveStartDate"]
     if "EffectiveSequence" in delta_df.columns:
         sort_cols.append("EffectiveSequence")
-
+    
     delta_df_sorted = delta_df.sort_values(by=sort_cols, ascending=[True, False, False])
     latest_cloud_records = delta_df_sorted.drop_duplicates(subset=["PersonNumber"], keep="first").set_index("PersonNumber")
 
     # --- 2. Prepare Input Data ---
-    # Normalize input df columns to handle 'actioncode', 'Actioncode', etc.
     df = normalize_columns(df, canonical_cols)
-
     if "PersonNumber" not in df.columns:
-        logger.warning("Input file missing 'PersonNumber' (checked case-insensitive). Skipping Delta logic.")
         return df
 
     df["EffectiveStartDate"] = pd.to_datetime(df["EffectiveStartDate"], errors='coerce')
+    df["EffectiveEndDate"] = pd.to_datetime(df["EffectiveEndDate"], errors='coerce')
+    df["PersonNumber"] = df["PersonNumber"].astype(str).str.strip()
     
-    # Ensure Reason for Failed column exists
     if "Reason for Failed" not in df.columns:
         df["Reason for Failed"] = ""
     else:
         df["Reason for Failed"] = df["Reason for Failed"].astype(str)
 
-    # --- 3. Iterate through Input Groups (Per Person) ---
-    grouped = df.sort_values(by=["PersonNumber", "EffectiveStartDate"]).groupby("PersonNumber")
+    # Helper for Section A Validation (Reusable)
+    def perform_section_a_checks(person_group, person_num):
+        # Sort by Date then Sequence
+        person_group = person_group.sort_values(by=["EffectiveStartDate", "EffectiveSequence"])
+        
+        # 1. Check First Row is HIRE
+        first_idx = person_group.index[0]
+        first_action = str(person_group.loc[first_idx, "ActionCode"]).strip().upper()
+        if first_action not in hire_actions:
+            msg = f"Section A Error: First row must be 'HIRE', found '{first_action}'."
+            df.at[first_idx, "Reason for Failed"] = f"{df.at[first_idx, 'Reason for Failed']}; {msg}"
+
+        # Iterate rows for Logic 2, 3, 5, 6, 7
+        prev_row = None
+        current_legal_emp = None
+        
+        for i in range(len(person_group)):
+            idx = person_group.index[i]
+            row = person_group.iloc[i]
+            action = str(row.get("ActionCode", "")).strip().upper()
+            eff_start = row["EffectiveStartDate"]
+            eff_end = row["EffectiveEndDate"]
+            legal_emp = str(row.get("LegalEmployerName", "")).strip()
+            bu_code = str(row.get("BusinessUnitShortCode", "")).strip()
+            status_code = str(row.get("AssignmentStatusTypeCode", "")).strip().upper()
+
+            # 2) Legal Employer Consistency
+            if action in hire_actions or action in rehire_actions or action in gt_actions:
+                current_legal_emp = legal_emp # Reset/Set expected
+            elif current_legal_emp and legal_emp != current_legal_emp:
+                 df.at[idx, "Reason for Failed"] += f"; Legal Employer mismatch. Expected '{current_legal_emp}'"
+
+            # 3) Global Transfer Logic
+            if action in gt_actions and prev_row is not None:
+                prev_legal = str(prev_row.get("LegalEmployerName", "")).strip()
+                prev_bu = str(prev_row.get("BusinessUnitShortCode", "")).strip()
+                if legal_emp == prev_legal and bu_code == prev_bu:
+                     df.at[idx, "Reason for Failed"] += "; GT requires change in Legal Employer or BU"
+                # Gap check
+                if prev_row["EffectiveEndDate"] + timedelta(days=1) != eff_start:
+                     df.at[idx, "Reason for Failed"] += "; Gap detected in GT"
+
+            # 5) Effective End Date Logic
+            # Look ahead to next row to validate End Date
+            if i < len(person_group) - 1:
+                next_row = person_group.iloc[i+1]
+                next_start = next_row["EffectiveStartDate"]
+                
+                if next_start == eff_start:
+                    # Same day multiple action: End Date can be same as Start Date (or 4712 if it's the very last in the stack, logic varies but usually same day)
+                    pass 
+                elif next_start > eff_start:
+                    # New Action on New Date: Previous End Date = New Start - 1
+                    expected_end = next_start - timedelta(days=1)
+                    if pd.notna(eff_end) and eff_end.date() != expected_end.date():
+                         df.at[idx, "Reason for Failed"] += f"; Incorrect EndDate. Expected {expected_end.date()}"
+
+            # 6) AssignmentStatusTypeCode
+            if action in term_actions:
+                if "INACTIVE" not in status_code:
+                    df.at[idx, "Reason for Failed"] += "; Status must be INACTIVE for Termination"
+            elif "SUSPEND" in action: # Loosely checking suspension
+                 if "SUSPENDED" not in status_code:
+                    df.at[idx, "Reason for Failed"] += "; Status must be SUSPENDED"
+            else:
+                if "ACTIVE" not in status_code and status_code != "":
+                     df.at[idx, "Reason for Failed"] += "; Status must be ACTIVE"
+
+            prev_row = row
+
+    # --- 3. Iterate through Input Groups ---
+    grouped = df.sort_values(by=["PersonNumber", "EffectiveStartDate", "EffectiveSequence"]).groupby("PersonNumber")
 
     for person_number, group in grouped:
-        # Determine if Person exists in Cloud
         is_in_cloud = person_number in latest_cloud_records.index
         
         if is_in_cloud:
-            # --- SECTION B: EMPLOYEE EXISTS (DELTA VALIDATION) ---
-            latest_cloud_row = latest_cloud_records.loc[person_number]
-            cloud_latest_date = latest_cloud_row["EffectiveStartDate"]
-            cloud_latest_action = str(latest_cloud_row.get("ActionCode", "")).strip().upper()
-            cloud_latest_asg_seq = latest_cloud_row.get("AssignmentSequence", 1)
-            cloud_latest_eff_seq = latest_cloud_row.get("EffectiveSequence", 1)
+            # --- SECTION B: DELTA LOAD ---
+            latest_row = latest_cloud_records.loc[person_number]
+            cloud_date = latest_row["EffectiveStartDate"]
+            cloud_action = str(latest_row.get("ActionCode", "")).strip().upper()
+            cloud_asg_seq = int(latest_row.get("AssignmentSequence", 1))
+            cloud_eff_seq = int(latest_row.get("EffectiveSequence", 1))
+            cloud_status = str(latest_row.get("STATUS", "")).strip().upper() # Assuming 'STATUS' col maps to normalized status
 
-            for idx, row in group.iterrows():
-                # Use .get() safely now that we know the canonical column name exists or we default to empty
-                incoming_action = str(row.get("ActionCode", "")).strip().upper()
-                incoming_date = row["EffectiveStartDate"]
-                failure_reasons = []
+            # Check first incoming row to decide logic path
+            first_incoming = group.iloc[0]
+            first_inc_action = str(first_incoming.get("ActionCode", "")).strip().upper()
 
-                # Special Check: If they exist, HIRE must match existing start date (Correction)
-                if incoming_action in hire_actions:
-                    if pd.notna(incoming_date) and pd.notna(cloud_latest_date):
-                        if incoming_date != cloud_latest_date:
-                            failure_reasons.append(f"Delta Error: Person exists. HIRE date ({incoming_date.date()}) must match existing cloud date ({cloud_latest_date.date()})")
+            if first_inc_action in hire_actions:
+                # --- Logic 1: Hire Correction ---
+                # 1.1 Effective start date match
+                inc_start = first_incoming["EffectiveStartDate"]
+                if pd.notna(inc_start) and pd.notna(cloud_date) and inc_start != cloud_date:
+                    df.at[first_incoming.name, "Reason for Failed"] += f"; Delta Error: HIRE date {inc_start.date()} must match Cloud HIRE date {cloud_date.date()}"
                 
-                # Standard Delta Logic (Updates, Rehires, Transfers)
-                else:
-                    if pd.notna(incoming_date) and pd.notna(cloud_latest_date):
-                        if incoming_date < cloud_latest_date:
-                            failure_reasons.append(f"Delta Error: EffectiveStartDate ({incoming_date.date()}) cannot be before latest cloud record ({cloud_latest_date.date()})")
-                        elif incoming_date == cloud_latest_date:
-                            # Same date, different action -> Sequence Check
-                            if incoming_action != cloud_latest_action:
-                                expected_seq = int(cloud_latest_eff_seq) + 1
-                                # Optional: Auto-correct EffectiveSequence here if needed
-                                # df.at[idx, "EffectiveSequence"] = expected_seq
+                # 1.2 Apply Section A validations
+                perform_section_a_checks(group, person_number)
 
-                    # Rehire Validation
-                    if incoming_action in rehire_actions:
-                        if cloud_latest_action not in term_actions:
-                            failure_reasons.append(f"Delta Error: Rehire failed. Current status ({cloud_latest_action}) is not Terminated.")
-                        else:
-                            if "AssignmentSequence" in df.columns:
-                                df.at[idx, "AssignmentSequence"] = int(cloud_latest_asg_seq) + 1
+            else:
+                # --- Logic 2: New Action / Rehire / GT ---
+                for idx, row in group.iterrows():
+                    inc_action = str(row.get("ActionCode", "")).strip().upper()
+                    inc_date = row["EffectiveStartDate"]
 
-                    # Global Transfer Validation
-                    elif incoming_action in gt_actions:
-                        if cloud_latest_action in term_actions:
-                            failure_reasons.append(f"Delta Error: Transfer failed. Current status is Terminated.")
-                        else:
-                            if "AssignmentSequence" in df.columns:
-                                df.at[idx, "AssignmentSequence"] = int(cloud_latest_asg_seq) + 1
-
-                # Log Failures
-                if failure_reasons:
-                    existing_reason = df.at[idx, "Reason for Failed"]
-                    if existing_reason == "nan": existing_reason = ""
+                    # 1.1 Min Date Check
+                    if pd.notna(inc_date) and pd.notna(cloud_date) and inc_date < cloud_date:
+                        df.at[idx, "Reason for Failed"] += f"; Date {inc_date.date()} is before Cloud Latest {cloud_date.date()}"
                     
-                    combined = "; ".join(failure_reasons)
-                    df.at[idx, "Reason for Failed"] = f"{existing_reason}; {combined}" if existing_reason else combined
+                    # 1.1.1 Sequence Increment (Same Date, Different Action)
+                    if inc_date == cloud_date and inc_action != cloud_action:
+                        df.at[idx, "EffectiveSequence"] = cloud_eff_seq + 1
+
+                    # 2) Rehire Logic
+                    if inc_action in rehire_actions:
+                        if "INACTIVE" not in cloud_status and cloud_action not in term_actions:
+                             df.at[idx, "Reason for Failed"] += "; Error: Rehire allowed only if previous status is Terminated"
+                        else:
+                             # 2.1 Increment Assignment Sequence (Iterator)
+                             df.at[idx, "AssignmentSequence"] = cloud_asg_seq + 1
+                             # 2.2 Date check
+                             if inc_date <= cloud_date:
+                                 df.at[idx, "Reason for Failed"] += "; Rehire date must be after Termination date"
+
+                    # 3) Global Transfer / Change Legal Employer
+                    elif inc_action in gt_actions:
+                        if "INACTIVE" in cloud_status or cloud_action in term_actions:
+                             df.at[idx, "Reason for Failed"] += "; Error: GT not allowed on Terminated employee"
+                        else:
+                             # 3.1 Increment Iterator
+                             df.at[idx, "AssignmentSequence"] = cloud_asg_seq + 1
 
         else:
-            # --- SECTION A: NEW HIRE (NOT IN CLOUD) ---
-            # Check that the FIRST action (chronologically) is HIRE
-            first_row_idx = group.index[0] 
-            first_action = str(group.loc[first_row_idx, "ActionCode"]).strip().upper() if "ActionCode" in group.columns else ""
-
-            if first_action not in hire_actions:
-                msg = f"New Hire Error: Person {person_number} not found in cloud. First action must be 'HIRE', found '{first_action}'."
-                # Mark all rows for this new person as failed if the start is wrong
-                for idx in group.index:
-                    existing = df.at[idx, "Reason for Failed"]
-                    if existing == "nan": existing = ""
-                    df.at[idx, "Reason for Failed"] = f"{existing}; {msg}" if existing else msg
+            # --- SECTION A: NEW HIRE ---
+            perform_section_a_checks(group, person_number)
 
     logger.info("Completed Dynamic Delta Validation.")
     return df
@@ -2961,56 +3019,65 @@ async def validate_data(payload: ValidatePayload):
         df.columns = [col.strip() for col in df.columns] # Clean column names
         df = df.fillna("") # Fill NaN values with empty string for consistent validation
 
-    # =========================================================================
-        # 4. DYNAMIC DELTA / NEW HIRE VALIDATION BLOCK (Now correctly placed)
-        # =========================================================================
-        delta_filename = f"{customerName}_{instanceName}_{component_name}_Report.csv"
-        delta_file_path = Path("required_files") / delta_filename
-        
+        # Initialize variables for Delta Logic
         delta_df = pd.DataFrame()
-        file_loaded = False
+        delta_logic_executed = False
 
-        if delta_file_path.exists():
-            logger.info(f"Found Delta file at: {delta_file_path}")
+    # =========================================================================
+    # 4. DYNAMIC DELTA / NEW HIRE VALIDATION BLOCK
+    # =========================================================================
+        if component_name.lower() == "assignment":
+            delta_filename = f"{customerName}_{instanceName}_{component_name}_Report.csv"
+            delta_file_path = Path("required_files") / delta_filename
             
-            # Robust Load: Try Excel (openpyxl) -> CSV -> Excel (xlrd)
-            if not file_loaded:
-                try:
+            file_loaded = False
+
+            if delta_file_path.exists():
+                logger.info(f"Found Delta file at: {delta_file_path}")
+                
+                # Robust Load: Try Excel (openpyxl) -> CSV -> Excel (xlrd)
+                if not file_loaded:
+                    try:
+                        delta_df = pd.read_excel(delta_file_path, engine='openpyxl')
+                        file_loaded = True
+                        logger.info("Successfully loaded Delta file using openpyxl.")
+                    except Exception: pass
+
+                if not file_loaded:
+                    try:
+                        delta_df = pd.read_csv(delta_file_path, sep=None, engine='python', encoding='utf-8-sig')
+                        # Remove non-alphanumeric characters from column names
+                        delta_df.columns = [col.replace('\ufeff', '').strip() for col in delta_df.columns]
+                        file_loaded = True
+                        logger.info("Successfully loaded Delta file as CSV.")
+                    except Exception as e: 
+                        logger.warning(f"CSV load failed: {e}")
+                        pass
+
+                if not file_loaded:
+                        logger.error("CRITICAL: Delta file exists but could not be read. Validation will proceed assuming New Hires.")
+            else:
+                    logger.warning(f"Delta file not found at {delta_file_path}. Validation will proceed assuming New Hires.")
+                    logger.warning(f"Calling the oracle to fetch report with {customerName} and {instanceName}")
+                    Report_Loading(customerName, instanceName, component_name)
                     delta_df = pd.read_excel(delta_file_path, engine='openpyxl')
                     file_loaded = True
-                    logger.info("Successfully loaded Delta file using openpyxl.")
-                except Exception: pass
-
-            if not file_loaded:
-                try:
-                    delta_df = pd.read_csv(delta_file_path, sep=None, engine='python')
-                    file_loaded = True
-                    logger.info("Successfully loaded Delta file as CSV.")
-                except Exception: pass
-
-            if not file_loaded:
-                    logger.error("CRITICAL: Delta file exists but could not be read. Validation will proceed assuming New Hires.")
-        else:
-                logger.warning(f"Delta file not found at {delta_file_path}. Validation will proceed assuming New Hires.")
-                logger.warning(f"Calling the oracle to fetch report with {customerName} and {instanceName}")
-                Report_Loading(customerName, instanceName, component_name)
-                delta_df = pd.read_excel(delta_file_path, engine='openpyxl')
-                file_loaded = True
-                logger.info("Successfully loaded Delta file using openpyxl after fetching from Oracle.")
-        # Execute Logic if Delta file is loaded
-        if not delta_df.empty:
-                try:
-                    # IMPORTANT: This function MUST be defined globally (outside this function)
-                    df = validate_delta_logic(
-                    df=df, 
-                    delta_df=delta_df,
-                    hire_actions=hire_actions,
-                    term_actions=term_actions,
-                    rehire_actions=rehire_actions,
-                    gt_actions=gt_actions
-                )
-                except Exception as logic_err:
-                    logger.error(f"Error executing Delta Logic: {logic_err}", exc_info=True)
+                    logger.info("Successfully loaded Delta file using openpyxl after fetching from Oracle.")
+            # Execute Logic if Delta file is loaded
+            if not delta_df.empty:
+                    try:
+                        # IMPORTANT: This function MUST be defined globally (outside this function)
+                        df = validate_delta_logic(
+                        df=df, 
+                        delta_df=delta_df,
+                        hire_actions=hire_actions,
+                        term_actions=term_actions,
+                        rehire_actions=rehire_actions,
+                        gt_actions=gt_actions
+                    )
+                        delta_logic_executed = True
+                    except Exception as logic_err:
+                        logger.error(f"Error executing Delta Logic: {logic_err}", exc_info=True)
         # =========================================================================
         # END DELTA BLOCK
         # =========================================================================
@@ -3155,51 +3222,56 @@ async def validate_data(payload: ValidatePayload):
 
         
         # 4. Custom validation: First row for a Person Number must be 'HIRE' based on minimum Start Date
-        logger.info("Starting custom validation: First row for Person Number must be 'HIRE'.")
-        
-        start_date_column = None
-        if "EffectiveStartDate" in df.columns:
-            start_date_column = "EffectiveStartDate"
-        elif "DateStart" in df.columns:
-            start_date_column = "DateStart"
+        # FIX: SKIP IF DELTA LOGIC HAS EXECUTED
+        if not delta_logic_executed:
+            logger.info("Starting custom validation: First row for Person Number must be 'HIRE'.")
+            
+            start_date_column = None
+            if "EffectiveStartDate" in df.columns:
+                start_date_column = "EffectiveStartDate"
+            elif "DateStart" in df.columns:
+                start_date_column = "DateStart"
 
-        if "PersonNumber" in df.columns and "ActionCode" in df.columns and start_date_column:
-            # Convert start_date_column to datetime, handling potential errors
-            df[start_date_column] = pd.to_datetime(df[start_date_column], errors='coerce')
+            if "PersonNumber" in df.columns and "ActionCode" in df.columns and start_date_column:
+                # Convert start_date_column to datetime, handling potential errors
+                df[start_date_column] = pd.to_datetime(df[start_date_column], errors='coerce')
 
-            # Drop rows where start_date_column could not be parsed, as they cannot be validated on date
-            df_cleaned_dates = df.dropna(subset=[start_date_column]).copy()
+                # Drop rows where start_date_column could not be parsed, as they cannot be validated on date
+                df_cleaned_dates = df.dropna(subset=[start_date_column]).copy()
 
-            # Group by Person Number and find the row with the minimum DateStart
-            idx = df_cleaned_dates.groupby('PersonNumber')[start_date_column].idxmin()
-            first_rows_for_person = df_cleaned_dates.loc[idx]
+                # Group by Person Number and find the row with the minimum DateStart
+                idx = df_cleaned_dates.groupby('PersonNumber')[start_date_column].idxmin()
+                first_rows_for_person = df_cleaned_dates.loc[idx]
 
-            for _, row in first_rows_for_person.iterrows():
-                person_number = row["PersonNumber"]
-                action_code = str(row["ActionCode"]).strip().upper()
+                for _, row in first_rows_for_person.iterrows():
+                    person_number = row["PersonNumber"]
+                    action_code = str(row["ActionCode"]).strip().upper()
 
-                if action_code not in hire_actions:
-                    # Find all original indices for this person_number to mark all their rows as failed
-                    original_indices_for_person = df[df["PersonNumber"] == person_number].index
-                    for i in original_indices_for_person:
-                        # Append the reason, ensuring it's not None
-                        current_reason = df.loc[i, "Reason for Failed"]
-                        if current_reason:
-                            df.loc[i, "Reason for Failed"] = f"{current_reason}; First action for PersonNumber '{person_number}' (based on minimum start date) must be 'HIRE', but was '{action_code}'"
-                        else:
-                            df.loc[i, "Reason for Failed"] = f"First action for PersonNumber '{person_number}' (based on minimum start date) must be 'HIRE', but was '{action_code}'"
-        else: 
-            missing_cols = []
-            if "PersonNumber" not in df.columns: missing_cols.append("PersonNumber")
-            if "ActionCode" not in df.columns: missing_cols.append("ActionCode")
-            if not start_date_column: missing_cols.append("EffectiveStartDate or DateStart") # Updated warning message
-            if missing_cols:
-                logger.warning(f"Skipping 'HIRE' validation due to missing column(s): {', '.join(missing_cols)}")
-        logger.info("Finished custom validation: First row for Person Number must be 'HIRE'.")
+                    if action_code not in hire_actions:
+                        # Find all original indices for this person_number to mark all their rows as failed
+                        original_indices_for_person = df[df["PersonNumber"] == person_number].index
+                        for i in original_indices_for_person:
+                            # Append the reason, ensuring it's not None
+                            current_reason = df.loc[i, "Reason for Failed"]
+                            if current_reason:
+                                df.loc[i, "Reason for Failed"] = f"{current_reason}; First action for PersonNumber '{person_number}' (based on minimum start date) must be 'HIRE', but was '{action_code}'"
+                            else:
+                                df.loc[i, "Reason for Failed"] = f"First action for PersonNumber '{person_number}' (based on minimum start date) must be 'HIRE', but was '{action_code}'"
+            else: 
+                missing_cols = []
+                if "PersonNumber" not in df.columns: missing_cols.append("PersonNumber")
+                if "ActionCode" not in df.columns: missing_cols.append("ActionCode")
+                if not start_date_column: missing_cols.append("EffectiveStartDate or DateStart") # Updated warning message
+                if missing_cols:
+                    logger.warning(f"Skipping 'HIRE' validation due to missing column(s): {', '.join(missing_cols)}")
+            logger.info("Finished custom validation: First row for Person Number must be 'HIRE'.")
+        else:
+             logger.info("Skipping generic 'First Row HIRE' validation because Delta Logic was executed.")
 
 
         # Legal Employer Name has to be consistant 
         logger.info("Starting validation: LegalEmployerName consistency check with reset on HIRE/TERMINATION/GT.")
+        start_date_column = "EffectiveStartDate" if "EffectiveStartDate" in df.columns else "DateStart"
         required_cols = ["PersonNumber", "ActionCode", start_date_column, "LegalEmployerName"]
         if all(col in df.columns for col in required_cols):
             df[start_date_column] = pd.to_datetime(df[start_date_column], errors='coerce')
@@ -3396,21 +3468,64 @@ async def validate_data(payload: ValidatePayload):
                 actioncode_col = col
             if col.strip().lower() == "personnumber":
                 personnumber_col = col
+
+        # --- FIX: Initialize Iterator from Cloud Max Sequence if Delta Logic Ran ---
+        cloud_max_seq_map = {}
+        if delta_logic_executed and not delta_df.empty:
+             try:
+                 # Assuming "AssignmentSequence" is the relevant column for iterator
+                 seq_col = "AssignmentSequence" 
+                 # Normalize column names in delta_df just in case
+                 delta_df_norm = delta_df.copy()
+                 delta_df_norm.columns = [str(c).replace(" ", "") for c in delta_df_norm.columns]
+                 
+                 if seq_col in delta_df_norm.columns:
+                     # Ensure numeric and fill NaNs
+                     delta_df_norm[seq_col] = pd.to_numeric(delta_df_norm[seq_col], errors='coerce').fillna(0)
+                     # Get Max per person
+                     if "PersonNumber" in delta_df_norm.columns:
+                         delta_df_norm["PersonNumber"] = delta_df_norm["PersonNumber"].astype(str).str.strip()
+                         cloud_max_seq_map = delta_df_norm.groupby("PersonNumber")[seq_col].max().to_dict()
+             except Exception as e:
+                 logger.warning(f"Failed to build iterator map from Cloud data: {e}")
+
         iterator_list = []
         iterator_counter = 0
         prev_person_number = None
-        combined_actions = hire_actions + gt_actions + rehire_actions
-        logger.error(f"Combined Actions is : {combined_actions}")
+        combined_actions_increment = gt_actions + rehire_actions # These definitely increment sequence
+        hire_correction_actions = hire_actions # These increment ONLY if starting from 0
+
         for _, row in passed_df.iterrows():
-            current_person_number = str(row[personnumber_col]) if personnumber_col else None
+            current_person_number = str(row[personnumber_col]).strip() if personnumber_col else None
+            
             if personnumber_col and current_person_number != prev_person_number:
-                iterator_counter = 0
+                # Reset or Initialize Iterator
+                if delta_logic_executed:
+                    # If person exists in cloud, start from their max sequence
+                    iterator_counter = int(cloud_max_seq_map.get(current_person_number, 0))
+                else:
+                    iterator_counter = 0
+                
                 prev_person_number = current_person_number
-            if actioncode_col and str(row[actioncode_col]).strip().upper() in combined_actions:
-                iterator_counter += 1
-                iterator_list.append(str(iterator_counter))
+            
+            # Determine if we need to increment
+            if actioncode_col:
+                action = str(row[actioncode_col]).strip().upper()
+                
+                if action in combined_actions_increment:
+                    iterator_counter += 1
+                elif action in hire_correction_actions:
+                    # Special Case: Hire only increments if we are at 0 (New Hire)
+                    # If we are at 1+ (Existing), a HIRE is a correction and shouldn't increment.
+                    if iterator_counter == 0:
+                        iterator_counter = 1
+                # Else (Promotion, Correction, etc) -> Do not increment, inherit current assignment ID
             else:
-                iterator_list.append(iterator_counter)
+                # Fallback if no action code? Just increment?
+                iterator_counter += 1 # Default behavior for unknown structures
+
+            iterator_list.append(str(iterator_counter))
+
 
         # Insert sourceKeys columns at the front, using iterator_list for {Iterator} (including as part of a string)
         source_keys = getattr(payload, 'sourceKeys', None)
@@ -3731,6 +3846,7 @@ async def validate_data(payload: ValidatePayload):
             "status": "success" if failed_df.empty else "failed",
             "passed_records_count": len(passed_df_final_output),
             "failed_records_count": len(failed_df),
+            "delta_logic_executed": delta_logic_executed,
             "passed_file_url": f"http://localhost:8000/validation_results/{passed_file_name}" if passed_file_name else None,
             "failed_file_url": f"http://localhost:8000/validation_results/{failed_file_name}" if failed_file_name else None,
             "errors": all_errors
@@ -3745,7 +3861,6 @@ async def validate_data(payload: ValidatePayload):
     except Exception as e:
         logger.exception("An error occurred during data validation.")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during validation: {str(e)}")
-
 
 
 class DeltaLoadPayload(BaseModel):
@@ -6325,7 +6440,8 @@ async def Report_Loading(customerName: str, instanceName: str, componentName: st
     except Exception as e:
         logger.error(f"Credential load error: {e}")
         return {"status": "error", "message": "Failed to load Oracle credentials"}
-
+    if componentName != "Assignment":
+        return {"status": "sucess", "message": "Delta load only available for Assignment component"}
     # Define Paths
     soap_save_zone = Path(f"{customerName}/{instanceName}/soap_temp_storage")
     soap_save_zone.mkdir(parents=True, exist_ok=True)
