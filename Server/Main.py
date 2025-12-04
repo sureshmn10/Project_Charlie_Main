@@ -3359,11 +3359,32 @@ async def validate_data(payload: ValidatePayload):
             )
             logger.info("Completed WorkRelationship-specific rules.")
 
-
+        
         
         # Filter passed and failed rows
         failed_df = df[df["Reason for Failed"] != ""].copy()
         passed_df = df[df["Reason for Failed"] == ""].copy()
+
+        # =========================================================================
+        # START: EFFECTIVE SEQUENCING LOGIC
+        # =========================================================================
+        if "PersonNumber" in passed_df.columns and "EffectiveStartDate" in passed_df.columns:
+            logger.info("Calculating EffectiveSequence for same-day transactions.")
+            
+            # Create temp date for sorting
+            passed_df["_tmp_eff_date"] = pd.to_datetime(passed_df["EffectiveStartDate"], errors='coerce')
+            
+            # Generate Sequence: Group by Person + Date
+            passed_df["EffectiveSequence"] = passed_df.groupby(["PersonNumber", "_tmp_eff_date"]).cumcount() + 1
+            
+            # Cleanup
+            passed_df.drop(columns=["_tmp_eff_date"], inplace=True)
+            
+            # Ensure the column is treated as part of the Excel columns so it gets exported
+            if "EffectiveSequence" not in original_excel_columns:
+                original_excel_columns.append("EffectiveSequence")
+            
+            logger.info("Effective Sequencing applied successfully.")
 
         # Save results to temporary files
         output_dir = VALIDATION_RESULTS_DIR
@@ -3742,7 +3763,7 @@ async def validate_data(payload: ValidatePayload):
             col_name = attr.Attributes
             dtype = str(attr.data_type).lower() if hasattr(attr, "data_type") else "string"
             column_type_map[col_name] = dtype
-
+        column_type_map["EffectiveSequence"] = "int" 
 
         # Update payload-enforcement cast
         passed_df_final_output = enforce_payload_dtypes_oracle_aware(passed_df_final_output, column_type_map)
