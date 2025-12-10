@@ -2710,6 +2710,7 @@ def validate_delta_logic(df, delta_df, hire_actions, term_actions, rehire_action
     - Checks if PersonNumber exists in Cloud (delta_df).
     - IF EXISTS (Delta Load = True): Performs Section B (Date continuity, Sequence checks).
     - IF NOT EXISTS (Delta Load = False): Performs Section A (Hire checks).
+    - Handles 'WorkSequence' (EffectiveSequence) increment logic for same-day actions.
     """
     logger.info("Starting Dynamic Delta/New Hire Validation...")
 
@@ -2720,6 +2721,7 @@ def validate_delta_logic(df, delta_df, hire_actions, term_actions, rehire_action
         "effectiveenddate": "EffectiveEndDate",
         "actioncode": "ActionCode",
         "effectivesequence": "EffectiveSequence",
+        "worksequence": "EffectiveSequence", # Map worksequence to EffectiveSequence
         "assignmentsequence": "AssignmentSequence",
         "reason for failed": "Reason for Failed",
         "legalemployername": "LegalEmployerName",
@@ -2772,6 +2774,10 @@ def validate_delta_logic(df, delta_df, hire_actions, term_actions, rehire_action
     df["EffectiveEndDate"] = pd.to_datetime(df["EffectiveEndDate"], errors='coerce')
     df["PersonNumber"] = df["PersonNumber"].astype(str).str.strip()
     
+    # Ensure EffectiveSequence column exists
+    if "EffectiveSequence" not in df.columns:
+        df["EffectiveSequence"] = 1
+
     if "Reason for Failed" not in df.columns:
         df["Reason for Failed"] = ""
     else:
@@ -2780,16 +2786,18 @@ def validate_delta_logic(df, delta_df, hire_actions, term_actions, rehire_action
     # Helper for Section A Validation (Reusable)
     def perform_section_a_checks(person_group, person_num):
         # Sort by Date then Sequence
-        person_group = person_group.sort_values(by=["EffectiveStartDate", "EffectiveSequence"])
+        # Note: We rely on the caller's sort order, but verifying here helps
+        # person_group = person_group.sort_values(by=["EffectiveStartDate", "EffectiveSequence"])
         
-        # 1. Check First Row is HIRE
-        first_idx = person_group.index[0]
-        first_action = str(person_group.loc[first_idx, "ActionCode"]).strip().upper()
-        if first_action not in hire_actions:
-            msg = f"Section A Error: First row must be 'HIRE', found '{first_action}'."
-            df.at[first_idx, "Reason for Failed"] = f"{df.at[first_idx, 'Reason for Failed']}; {msg}"
+        # 1. Check First Row is HIRE (Only if it's the very first action in history, checked by logic below)
+        # In this helper, we assume we are checking the whole group for a new hire
+        if len(person_group) > 0:
+            first_idx = person_group.index[0]
+            first_action = str(person_group.loc[first_idx, "ActionCode"]).strip().upper()
+            if first_action not in hire_actions:
+                msg = f"Section A Error: First row must be 'HIRE', found '{first_action}'."
+                df.at[first_idx, "Reason for Failed"] = f"{df.at[first_idx, 'Reason for Failed']}; {msg}"
 
-        # Iterate rows for Logic 2, 3, 5, 6, 7
         prev_row = None
         current_legal_emp = None
         
@@ -2820,16 +2828,10 @@ def validate_delta_logic(df, delta_df, hire_actions, term_actions, rehire_action
                      df.at[idx, "Reason for Failed"] += "; Gap detected in GT"
 
             # 5) Effective End Date Logic
-            # Look ahead to next row to validate End Date
             if i < len(person_group) - 1:
                 next_row = person_group.iloc[i+1]
                 next_start = next_row["EffectiveStartDate"]
-                
-                if next_start == eff_start:
-                    # Same day multiple action: End Date can be same as Start Date (or 4712 if it's the very last in the stack, logic varies but usually same day)
-                    pass 
-                elif next_start > eff_start:
-                    # New Action on New Date: Previous End Date = New Start - 1
+                if next_start > eff_start:
                     expected_end = next_start - timedelta(days=1)
                     if pd.notna(eff_end) and eff_end.date() != expected_end.date():
                          df.at[idx, "Reason for Failed"] += f"; Incorrect EndDate. Expected {expected_end.date()}"
@@ -2838,7 +2840,7 @@ def validate_delta_logic(df, delta_df, hire_actions, term_actions, rehire_action
             if action in term_actions:
                 if "INACTIVE" not in status_code:
                     df.at[idx, "Reason for Failed"] += "; Status must be INACTIVE for Termination"
-            elif "SUSPEND" in action: # Loosely checking suspension
+            elif "SUSPEND" in action:
                  if "SUSPENDED" not in status_code:
                     df.at[idx, "Reason for Failed"] += "; Status must be SUSPENDED"
             else:
@@ -2848,72 +2850,99 @@ def validate_delta_logic(df, delta_df, hire_actions, term_actions, rehire_action
             prev_row = row
 
     # --- 3. Iterate through Input Groups ---
+    # Sort input by Person, Date, and potentially Sequence if provided, or index to maintain Excel order
     grouped = df.sort_values(by=["PersonNumber", "EffectiveStartDate", "EffectiveSequence"]).groupby("PersonNumber")
 
     for person_number, group in grouped:
         is_in_cloud = person_number in latest_cloud_records.index
         
+        # --- State Initialization for Sequence Logic ---
         if is_in_cloud:
-            # --- SECTION B: DELTA LOAD ---
             latest_row = latest_cloud_records.loc[person_number]
-            cloud_date = latest_row["EffectiveStartDate"]
-            cloud_action = str(latest_row.get("ActionCode", "")).strip().upper()
-            cloud_asg_seq = int(latest_row.get("AssignmentSequence", 1))
-            cloud_eff_seq = int(latest_row.get("EffectiveSequence", 1))
-            cloud_status = str(latest_row.get("STATUS", "")).strip().upper() # Assuming 'STATUS' col maps to normalized status
-
-            # Check first incoming row to decide logic path
-            first_incoming = group.iloc[0]
-            first_inc_action = str(first_incoming.get("ActionCode", "")).strip().upper()
-
-            if first_inc_action in hire_actions:
-                # --- Logic 1: Hire Correction ---
-                # 1.1 Effective start date match
-                inc_start = first_incoming["EffectiveStartDate"]
-                if pd.notna(inc_start) and pd.notna(cloud_date) and inc_start != cloud_date:
-                    df.at[first_incoming.name, "Reason for Failed"] += f"; Delta Error: HIRE date {inc_start.date()} must match Cloud HIRE date {cloud_date.date()}"
-                
-                # 1.2 Apply Section A validations
-                perform_section_a_checks(group, person_number)
-
-            else:
-                # --- Logic 2: New Action / Rehire / GT ---
-                for idx, row in group.iterrows():
-                    inc_action = str(row.get("ActionCode", "")).strip().upper()
-                    inc_date = row["EffectiveStartDate"]
-
-                    # 1.1 Min Date Check
-                    if pd.notna(inc_date) and pd.notna(cloud_date) and inc_date < cloud_date:
-                        df.at[idx, "Reason for Failed"] += f"; Date {inc_date.date()} is before Cloud Latest {cloud_date.date()}"
-                    
-                    # 1.1.1 Sequence Increment (Same Date, Different Action)
-                    if inc_date == cloud_date and inc_action != cloud_action:
-                        df.at[idx, "EffectiveSequence"] = cloud_eff_seq + 1
-
-                    # 2) Rehire Logic
-                    if inc_action in rehire_actions:
-                        if "INACTIVE" not in cloud_status and cloud_action not in term_actions:
-                             df.at[idx, "Reason for Failed"] += "; Error: Rehire allowed only if previous status is Terminated"
-                        else:
-                             # 2.1 Increment Assignment Sequence (Iterator)
-                             df.at[idx, "AssignmentSequence"] = cloud_asg_seq + 1
-                             # 2.2 Date check
-                             if inc_date <= cloud_date:
-                                 df.at[idx, "Reason for Failed"] += "; Rehire date must be after Termination date"
-
-                    # 3) Global Transfer / Change Legal Employer
-                    elif inc_action in gt_actions:
-                        if "INACTIVE" in cloud_status or cloud_action in term_actions:
-                             df.at[idx, "Reason for Failed"] += "; Error: GT not allowed on Terminated employee"
-                        else:
-                             # 3.1 Increment Iterator
-                             df.at[idx, "AssignmentSequence"] = cloud_asg_seq + 1
-
+            curr_date = latest_row["EffectiveStartDate"]
+            curr_seq = int(latest_row.get("EffectiveSequence", 1))
+            curr_action = str(latest_row.get("ActionCode", "")).strip().upper()
+            curr_asg_seq = int(latest_row.get("AssignmentSequence", 1))
+            curr_status = str(latest_row.get("STATUS", "")).strip().upper()
         else:
-            # --- SECTION A: NEW HIRE ---
+            # New Hire / Not in Cloud
+            curr_date = None
+            curr_seq = 0
+            curr_action = ""
+            curr_asg_seq = 1
+            curr_status = ""
+
+        # --- Process Rows for Sequence & Logic ---
+        for idx, row in group.iterrows():
+            inc_date = row["EffectiveStartDate"]
+            inc_action = str(row.get("ActionCode", "")).strip().upper()
+
+            # --- 1. Effective Sequence Logic (WorkSequence) ---
+            new_seq = 1
+            if pd.notna(inc_date):
+                if curr_date is not None and inc_date == curr_date:
+                    # Same date: Increment sequence if actions differ (or force increment for multiple rows)
+                    if inc_action != curr_action:
+                        new_seq = curr_seq + 1
+                    else:
+                        # Logic: If strict requirement "2 changes in action code... then sequence increment"
+                        new_seq = curr_seq + 1
+                elif curr_date is not None and inc_date < curr_date:
+                    # Input date is older than current/cloud date -> Logic error or Correction
+                    # For safety in this specific "Delta" logic, we might not auto-calculate correctly without full history.
+                    # We leave it as 1 or rely on user input if provided, but here we reset to 1.
+                    new_seq = 1
+                    df.at[idx, "Reason for Failed"] += f"; Date {inc_date.date()} is before Cloud/Previous {curr_date.date()}"
+                else:
+                    # New future date
+                    new_seq = 1
+            
+            # Apply calculated sequence
+            df.at[idx, "EffectiveSequence"] = new_seq
+            
+            # Update state
+            curr_date = inc_date
+            curr_seq = new_seq
+            curr_action = inc_action
+
+            # --- 2. Assignment Sequence Logic ---
+            if is_in_cloud:
+                # Delta specific checks
+                if inc_action in rehire_actions:
+                    if "INACTIVE" not in curr_status and curr_action not in term_actions:
+                         df.at[idx, "Reason for Failed"] += "; Error: Rehire allowed only if previous status is Terminated"
+                    else:
+                         curr_asg_seq += 1
+                         df.at[idx, "AssignmentSequence"] = curr_asg_seq
+                elif inc_action in gt_actions:
+                    if "INACTIVE" in curr_status or curr_action in term_actions:
+                         df.at[idx, "Reason for Failed"] += "; Error: GT not allowed on Terminated employee"
+                    else:
+                         curr_asg_seq += 1
+                         df.at[idx, "AssignmentSequence"] = curr_asg_seq
+            else:
+                 # New Hire Assignment Sequence is usually 1, handled by default
+                 pass
+
+        # --- Perform Section A Checks (New Hire Logic) ---
+        if is_in_cloud:
+             # Check for logic specific to Delta (e.g., date mismatches on HIRE correction)
+             first_incoming = group.iloc[0]
+             first_inc_action = str(first_incoming.get("ActionCode", "")).strip().upper()
+             
+             if first_inc_action in hire_actions:
+                 cloud_hire_date = latest_cloud_records.loc[person_number]["EffectiveStartDate"]
+                 inc_start = first_incoming["EffectiveStartDate"]
+                 if pd.notna(inc_start) and pd.notna(cloud_hire_date) and inc_start != cloud_hire_date:
+                    df.at[first_incoming.name, "Reason for Failed"] += f"; Delta Error: HIRE date {inc_start.date()} must match Cloud HIRE date {cloud_hire_date.date()}"
+                 
+                 # Even if in cloud, if they are sending a HIRE row, we might want to run A-checks on the input stack
+                 perform_section_a_checks(group, person_number)
+        else:
+            # Full New Hire Validation
             perform_section_a_checks(group, person_number)
 
-    logger.info("Completed Dynamic Delta Validation.")
+    logger.info("Completed Dynamic Delta Validation with WorkSequence Logic.")
     return df
 
 class AttributeConfig(BaseModel):
@@ -3114,6 +3143,46 @@ async def validate_data(payload: ValidatePayload):
 
         # 2b. Perform Key Values Uniqueness Validation
         logger.info("Starting key values uniqueness validation.")
+
+        # EffectiveSequence validation
+        #if the column exists 
+        if "EffectiveSequence" in df.columns:
+            logger.info("Starting WorkSequence auto-correction...")
+            
+            for person_number, group in df.groupby("PersonNumber"):
+                # Sort ensures we process in the correct chronological order
+                group = group.sort_values(by=["EffectiveStartDate", "EffectiveSequence"])
+                indices = group.index
+                
+                # Initialize trackers with the first row of the group
+                if len(indices) > 0:
+                    previous_date = df.at[indices[0], "EffectiveStartDate"]
+                    previous_sequence = df.at[indices[0], "EffectiveSequence"]
+
+                # Iterate starting from the second row
+                for i in range(1, len(indices)):
+                    idx = indices[i]
+                    current_date = df.at[idx, "EffectiveStartDate"]
+                    current_seq = df.at[idx, "EffectiveSequence"]
+
+                    if current_date == previous_date:
+                        # If same day, ensure strictly increasing sequence
+                        if current_seq <= previous_sequence:
+                            new_sequence = previous_sequence + 1
+                            df.at[idx, "EffectiveSequence"] = new_sequence
+                            
+                            # Log the correction if needed
+                            logger.info(f"Auto-corrected Person {person_number} on {current_date.date()}: {current_seq} -> {new_sequence}")
+                            
+                            # Update the tracker to the new valid sequence
+                            current_seq = new_sequence
+                    
+                    # Update trackers for the next iteration
+                    previous_date = current_date
+                    previous_sequence = current_seq
+
+            logger.info("Finished WorkSequence validation and correction.")
+
 
         
 

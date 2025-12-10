@@ -47,7 +47,7 @@ app.logger.setLevel(logging.DEBUG) # Ensure Flask's internal logger is also DEBU
 
 
 # Configure Gemini client
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyCCFXd3bAAVonA9FAf2kvRlcnt6wKFkaHw')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyAWV8HDQ6-2ImDEPG1aZA7F_qf0VJYKyWs')
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 
 model = None
