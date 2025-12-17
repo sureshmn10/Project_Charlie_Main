@@ -8,7 +8,7 @@ echo "==============================="
 echo "   Charlie Tool Backend Setup"
 echo "==============================="
 
-
+# --- FIX 1: Correct Directory Context ---
 cd "$(dirname "$0")"
 # ✅ Move into Server directory
 cd Server || { echo "❌ Server directory not found!"; exit 1; }
@@ -38,20 +38,36 @@ fi
 echo "🔍 Scanning for __pycache__ folders..."
 find . -type d -name "__pycache__" -exec rm -rf {} +
 
-# Step 2: Check Python
+# --- FIX 2: Force Python 3.10+ ---
 echo
-echo "[2] Checking Python..."
-if ! command -v python3 &>/dev/null; then
-    echo "❌ Python3 not found. Please install Python 3.11+ (brew install python3)."
-    exit 1
+echo "[2] Checking for Python 3.10 or newer..."
+
+# We prioritize 3.11, then 3.10. We skip system "python3" if it is 3.9 or older.
+if command -v python3.11 &>/dev/null; then
+    PYTHON_CMD="python3.11"
+    echo "✅ Found Python 3.11"
+elif command -v python3.10 &>/dev/null; then
+    PYTHON_CMD="python3.10"
+    echo "✅ Found Python 3.10"
 else
-    python3 --version
+    # Fallback check: Is the default 'python3' actually new enough?
+    VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    if (( $(echo "$VER >= 3.10" | bc -l) )); then
+        PYTHON_CMD="python3"
+        echo "✅ Found Python $VER (via python3)"
+    else
+        echo "❌ Critical Error: Python 3.10+ is required."
+        echo "   Your current version is: $VER"
+        echo "👉 Please install newer Python: https://www.python.org/downloads/macos/"
+        exit 1
+    fi
 fi
+# ---------------------------------
 
 # Step 3: Create virtual environment
 echo
-echo "[3] Creating new virtual environment..."
-python3 -m venv venv
+echo "[3] Creating new virtual environment using $PYTHON_CMD..."
+$PYTHON_CMD -m venv venv
 if [ ! -d "venv" ]; then
     echo "❌ Failed to create virtual environment."
     exit 1
@@ -65,6 +81,9 @@ source venv/bin/activate || { echo "❌ Failed to activate virtual environment."
 # Step 5: Install dependencies
 echo
 echo "[5] Installing dependencies..."
+# Upgrade pip first to avoid issues
+pip install --upgrade pip
+
 if [ -f requirements.txt ]; then
     echo "✅ Found requirements.txt"
     pip install -r requirements.txt
