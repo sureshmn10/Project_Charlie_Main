@@ -4,6 +4,10 @@
 #  Charlie Tool FastAPI Launcher (macOS/Linux)
 # =============================================
 
+# --- FIX: Ensure we are in the script's directory ---
+cd "$(dirname "$0")" || exit
+# ----------------------------------------------------
+
 PORT=3000
 MODULE="main:app"
 
@@ -12,6 +16,7 @@ echo "🔥 Starting Charlie Tool FastAPI Frontend Server"
 echo "============================================"
 echo "Time: $(date)"
 echo "Port: $PORT"
+echo "Working Directory: $(pwd)"  # Added for verification
 echo "--------------------------------------------"
 
 # Step 0: Check Python
@@ -68,7 +73,8 @@ fi
 echo "🚀 Starting FastAPI server on http://localhost:$PORT"
 open "http://localhost:$PORT" 2>/dev/null || xdg-open "http://localhost:$PORT" 2>/dev/null
 
-python3 -m uvicorn $MODULE --port $PORT
+# Now this will work because we cd'd to the correct folder earlier
+python3 -m uvicorn $MODULE --port $PORT --reload
 if [ $? -ne 0 ]; then
     echo "❌ Failed to launch FastAPI server. Check module path: $MODULE"
     exit 1
