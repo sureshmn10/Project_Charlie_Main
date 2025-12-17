@@ -1,136 +1,122 @@
 #!/bin/bash
 
 # ===========================================
-#   Charlie Tool Backend Setup (macOS/Linux)
+#   Charlie Tool Backend Setup (Auto-Install)
 # ===========================================
 
-echo "==============================="
-echo "   Charlie Tool Backend Setup"
-echo "==============================="
-
-# --- FIX 1: Correct Directory Context ---
+# --- 1. Fix Directory Context ---
 cd "$(dirname "$0")"
-# ✅ Move into Server directory
-cd Server || { echo "❌ Server directory not found!"; exit 1; }
+cd Server || { echo "❌ Server directory not found! Make sure this script is next to the 'Server' folder."; exit 1; }
 
-# Step 0: Kill process on port 8000
-echo
-echo "[0] Checking and killing process on port 8000 if exists..."
-PID=$(lsof -ti:8000)
-if [ -n "$PID" ]; then
-    echo "⚠️ Killing PID $PID..."
-    kill -9 $PID
-    echo "✅ Port 8000 freed."
-else
-    echo "✅ No process on port 8000."
-fi
+echo "=========================================="
+echo "   Charlie Tool - Backend Launcher"
+echo "=========================================="
+echo "📂 Working in: $(pwd)"
 
-# Step 1: Cleanup previous venv & __pycache__
-echo
-echo "[1] Cleaning up previous virtual environment and __pycache__ folders..."
-if [ -d "venv" ]; then
-    echo "🧹 Removing existing venv..."
-    rm -rf venv
-else
-    echo "✅ No existing venv found."
-fi
+# --- 2. Define Version Settings ---
+PYTHON_VERSION="3.13"
+EXACT_VERSION="3.13.4"
+# Official Python macOS Installer URL
+INSTALLER_URL="https://www.python.org/ftp/python/${EXACT_VERSION}/python-${EXACT_VERSION}-macos11.pkg"
 
-echo "🔍 Scanning for __pycache__ folders..."
-find . -type d -name "__pycache__" -exec rm -rf {} +
+# --- 3. Function to Check & Install Python ---
+ensure_python() {
+    echo
+    echo "[1] Checking for Python $PYTHON_VERSION..."
 
-# --- FIX 2: Force Python 3.10+ ---
-echo
-echo "[2] Checking for Python 3.10 or newer..."
+    # Check if python3.13 command exists
+    if command -v python$PYTHON_VERSION &>/dev/null; then
+        echo "✅ Python $PYTHON_VERSION is already installed."
+        PY_CMD="python$PYTHON_VERSION"
+        return
+    fi
 
-# We prioritize 3.11, then 3.10. We skip system "python3" if it is 3.9 or older.
-if command -v python3.11 &>/dev/null; then
-    PYTHON_CMD="python3.11"
-    echo "✅ Found Python 3.11"
-elif command -v python3.10 &>/dev/null; then
-    PYTHON_CMD="python3.10"
-    echo "✅ Found Python 3.10"
-else
-    # Fallback check: Is the default 'python3' actually new enough?
-    VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    if (( $(echo "$VER >= 3.10" | bc -l) )); then
-        PYTHON_CMD="python3"
-        echo "✅ Found Python $VER (via python3)"
+    echo "❌ Python $PYTHON_VERSION not found."
+    echo "⚙️  Initiating automatic installation for Python $EXACT_VERSION..."
+
+    # Check for Homebrew
+    if command -v brew &>/dev/null; then
+        echo "🍺 Homebrew detected. Installing via Homebrew..."
+        brew install python@$PYTHON_VERSION
+        
+        # Link it so it's available
+        brew link python@$PYTHON_VERSION
     else
-        echo "❌ Critical Error: Python 3.10+ is required."
-        echo "   Your current version is: $VER"
-        echo "👉 Please install newer Python: https://www.python.org/downloads/macos/"
+        echo "🌐 Homebrew not found. Downloading official installer..."
+        INSTALLER_PATH="/tmp/python-$EXACT_VERSION.pkg"
+        
+        # Download the pkg
+        curl -o "$INSTALLER_PATH" "$INSTALLER_URL"
+        
+        if [ -f "$INSTALLER_PATH" ]; then
+            echo "📦 Opening installer..."
+            open "$INSTALLER_PATH"
+            echo "⚠️  PLEASE COMPLETE THE INSTALLATION WINDOW THAT JUST OPENED."
+            echo "👉 Press [ENTER] here once you have finished installing Python."
+            read -r
+        else
+            echo "❌ Failed to download python installer. Please check your internet."
+            exit 1
+        fi
+    fi
+
+    # Verify installation succeeded
+    if command -v python$PYTHON_VERSION &>/dev/null; then
+        echo "✅ Python $PYTHON_VERSION successfully installed!"
+        PY_CMD="python$PYTHON_VERSION"
+    else
+        echo "❌ Installation check failed. Please install Python $EXACT_VERSION manually."
+        exit 1
+    fi
+}
+
+# Run the check/install logic
+ensure_python
+
+# --- 4. Clean & Setup Virtual Environment ---
+echo
+echo "[2] Setting up Virtual Environment..."
+
+# If venv exists, check if it's the wrong version
+if [ -d "venv" ]; then
+    VENV_VER=$(venv/bin/python --version 2>&1)
+    if [[ "$VENV_VER" != *"$PYTHON_VERSION"* ]]; then
+        echo "⚠️  Old venv detected ($VENV_VER). Removing to upgrade to $PYTHON_VERSION..."
+        rm -rf venv
+    fi
+fi
+
+# Create new venv if missing
+if [ ! -d "venv" ]; then
+    echo "📦 Creating venv using $PY_CMD..."
+    $PY_CMD -m venv venv
+    if [ $? -ne 0 ]; then
+        echo "❌ Failed to create venv. Make sure Python is working correctly."
         exit 1
     fi
 fi
-# ---------------------------------
 
-# Step 3: Create virtual environment
+# --- 5. Install Dependencies & Launch ---
 echo
-echo "[3] Creating new virtual environment using $PYTHON_CMD..."
-$PYTHON_CMD -m venv venv
-if [ ! -d "venv" ]; then
-    echo "❌ Failed to create virtual environment."
-    exit 1
-fi
+echo "[3] Activating & Launching..."
+source venv/bin/activate
 
-# Step 4: Activate virtual environment
-echo
-echo "[4] Activating virtual environment..."
-source venv/bin/activate || { echo "❌ Failed to activate virtual environment."; exit 1; }
+# Ensure pip is up to date
+pip install --upgrade pip &>/dev/null
 
-# Step 5: Install dependencies
-echo
-echo "[5] Installing dependencies..."
-# Upgrade pip first to avoid issues
-pip install --upgrade pip
-
-if [ -f requirements.txt ]; then
-    echo "✅ Found requirements.txt"
-    pip install -r requirements.txt
-elif [ -f Requirements.txt ]; then
-    echo "✅ Found Requirements.txt"
-    pip install -r Requirements.txt
-else
-    echo "❌ No requirements file found."
-    deactivate
-    exit 1
-fi
-
-# Step 6: Verify Main.py exists
-echo
-echo "[6] Checking Main.py..."
-if [ ! -f Main.py ]; then
-    echo "❌ Main.py not found in Server directory!"
-    deactivate
-    exit 1
-fi
-
-# Step 7: Run server
-echo
-echo "[7] Starting FastAPI server with Uvicorn..."
+# Install requirements if needed (silently check if uvicorn exists)
 if ! pip show uvicorn &>/dev/null; then
-    echo "⚠️ Uvicorn not installed, installing now..."
-    pip install uvicorn
+    echo "📥 Installing dependencies (this may take a moment)..."
+    pip install -r requirements.txt 2>/dev/null || pip install uvicorn fastapi
 fi
 
-echo "🚀 Launching FastAPI server..."
-python -m uvicorn Main:app --reload --port 8000 &
+# Kill old process if running
+PID=$(lsof -ti:8000)
+if [ -n "$PID" ]; then
+    kill -9 $PID
+fi
 
-SERVER_PID=$!
-echo "🎉 Server started (PID: $SERVER_PID). Access it at: http://127.0.0.1:8000"
-
-# Optional: Step 8 cleanup port 8000 on exit
-cleanup() {
-    echo
-    echo "[8] Cleaning up process on port 8000..."
-    kill -9 $SERVER_PID 2>/dev/null
-    echo "🛑 Server stopped."
-    deactivate
-    exit 0
-}
-
-# Trap CTRL+C to cleanup
-trap cleanup SIGINT
-
-# Keep script alive
-wait $SERVER_PID
+echo "🚀 Starting FastAPI Server with Python $PYTHON_VERSION..."
+echo "-----------------------------------------------------"
+# Run Server
+python -m uvicorn Main:app --reload --port 8000
