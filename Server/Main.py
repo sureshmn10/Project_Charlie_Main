@@ -8154,3 +8154,121 @@ async def post_validation_excel(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/extract-headers")
+async def extract_headers(file: UploadFile = File(...)):
+    """
+    Reads an Excel file and returns the list of column headers.
+    """
+    try:
+        contents = await file.read()
+        try:
+             df = pd.read_excel(io.BytesIO(contents), nrows=5, engine='openpyxl')
+        except:
+             file.file.seek(0)
+             contents = await file.read()
+             df = pd.read_excel(io.BytesIO(contents), nrows=5)
+             
+        headers = df.columns.tolist()
+        return {"headers": headers}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error reading file headers: {str(e)}")
+
+@app.post("/convert-excel")
+async def convert_excel(
+    structure_file: UploadFile = File(...),
+    target_file: UploadFile = File(...),
+    legacy_col: str = Form(...),
+    oracle_col: str = Form(...),
+    attribute_col: str = Form(None), # Optional: Triggers Dynamic Mode
+    target_col: str = Form(None),    # Optional: Used only if Dynamic Mode is OFF
+):
+    """
+    Transforms the target_file using mapping rules from structure_file.
+    
+    DYNAMIC MODE (if attribute_col is provided):
+    - Iterates through ALL columns in target_file.
+    - If a column name matches a value in structure_file[attribute_col], 
+      it applies the specific mapping for that attribute.
+      
+    SINGLE COLUMN MODE (if attribute_col is None):
+    - Requires target_col.
+    - Transforms only that specific column using global mapping.
+    """
+    try:
+        # 1. Read Structure File (The Map)
+        structure_content = await structure_file.read()
+        try:
+            df_structure = pd.read_excel(io.BytesIO(structure_content), engine='openpyxl')
+        except:
+            df_structure = pd.read_excel(io.BytesIO(structure_content))
+
+        # Validate columns exist
+        if legacy_col not in df_structure.columns or oracle_col not in df_structure.columns:
+            raise HTTPException(status_code=400, detail="Selected mapping columns not found in the Structure Excel file.")
+
+        # 2. Read Target File (The Data)
+        target_content = await target_file.read()
+        try:
+            df_target = pd.read_excel(io.BytesIO(target_content), engine='openpyxl')
+        except:
+            df_target = pd.read_excel(io.BytesIO(target_content))
+
+        transform_log = []
+
+        # --- LOGIC BRANCHING ---
+        if attribute_col and attribute_col in df_structure.columns:
+            # === DYNAMIC MODE ===
+            # Normalize attribute column for matching
+            df_structure[attribute_col] = df_structure[attribute_col].astype(str).str.strip()
+            
+            # Iterate through every column in the target file
+            for col in df_target.columns:
+                col_name = str(col).strip()
+                
+                # Check if this column name is defined in the structure file
+                if col_name in df_structure[attribute_col].values:
+                    # Filter structure rules for this specific column
+                    subset = df_structure[df_structure[attribute_col] == col_name]
+                    
+                    # Create Map: Legacy -> Oracle
+                    mapping = dict(zip(subset[legacy_col], subset[oracle_col]))
+                    
+                    # Apply Map
+                    # Convert to string to ensure mapping works (handling type mismatches)
+                    # Use map().fillna() to keep original values if no match found
+                    df_target[col] = df_target[col].map(mapping).fillna(df_target[col])
+                    transform_log.append(col_name)
+
+            if not transform_log:
+                # Warning if no columns matched, but we still return the file
+                print("Warning: No matching columns found in target file based on Attribute names.")
+
+        else:
+            # === SINGLE COLUMN MODE (Fallback) ===
+            if not target_col:
+                raise HTTPException(status_code=400, detail="Target column must be specified if Attribute column is not used.")
+            
+            if target_col in df_target.columns:
+                mapping_df = df_structure[[legacy_col, oracle_col]].drop_duplicates(subset=[legacy_col])
+                mapping_dict = dict(zip(mapping_df[legacy_col], mapping_df[oracle_col]))
+                df_target[target_col] = df_target[target_col].map(mapping_dict).fillna(df_target[target_col])
+            else:
+                 raise HTTPException(status_code=400, detail=f"Column '{target_col}' not found in the Target file.")
+
+        # 3. Save to Buffer
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_target.to_excel(writer, index=False)
+        
+        output.seek(0)
+
+        filename_prefix = "Dynamic_Transformed" if attribute_col else f"Transformed_{target_col}"
+        headers = {
+            'Content-Disposition': f'attachment; filename="{filename_prefix}.xlsx"'
+        }
+        return StreamingResponse(output, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transformation failed: {str(e)}")
