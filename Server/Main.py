@@ -7692,7 +7692,7 @@ async def get_excel_sheets(
             status_code=500,
         )
     
-GOOGLE_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyCCFXd3bAAVonA9FAf2kvRlcnt6wKFkaHw')
+GOOGLE_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyBTrQKaRXl-pYpcfLj0JGYQFHLg0hHtX_c')
 genai.configure(api_key=GOOGLE_API_KEY)
 
 def get_smart_mapping_from_gemini(legacy_cols: List[str], oracle_cols: List[str]) -> Dict[str, str]:
@@ -7828,7 +7828,9 @@ async def post_validation_excel(
 ):
     """
     Post-validation endpoint.
-    Generates a multi-sheet Excel report including a styled Summary.
+    Updated Logic:
+    - Consistent = Rows in BOTH files.
+    - Inconsistent = Rows in ONLY PeopleSoft + Rows in ONLY Oracle Cloud.
     """
 
     temp_dir = tempfile.mkdtemp()
@@ -7861,35 +7863,24 @@ async def post_validation_excel(
             legacy_df = pd.read_excel(io.BytesIO(legacy_content))
             legacy_df.columns = legacy_df.columns.astype(str).str.strip()
         except Exception as e:
-             raise HTTPException(status_code=400, detail=f"Error reading Legacy file: {str(e)}")
+             raise HTTPException(status_code=400, detail=f"Error reading PeopleSoft (Legacy) file: {str(e)}")
 
         try:
             oracle_content = await oracleFile.read()
             oracle_df = pd.read_excel(io.BytesIO(oracle_content))
             oracle_df.columns = oracle_df.columns.astype(str).str.strip()
         except Exception as e:
-             raise HTTPException(status_code=400, detail=f"Error reading Oracle file: {str(e)}")
+             raise HTTPException(status_code=400, detail=f"Error reading Oracle Cloud file: {str(e)}")
 
         # --- [Validation Checks] ---
         missing = []
-
-        # Check Mappings
         for l, o in mappings_dict.items():
-            if l not in legacy_df.columns: missing.append(f"Legacy column '{l}' not found")
-            if o not in oracle_df.columns: missing.append(f"Oracle column '{o}' not found")
-
-        # Check Included Columns
-        for col in included_cols_list:
-            if col not in legacy_df.columns: missing.append(f"Included column '{col}' not found")
-
-        # Check Key Columns
+            if l not in legacy_df.columns: missing.append(f"PeopleSoft column '{l}' not found")
+            if o not in oracle_df.columns: missing.append(f"Oracle Cloud column '{o}' not found")
         for k_col in key_cols_list:
-            if k_col not in legacy_df.columns:
-                missing.append(f"Key column '{k_col}' missing in Legacy sheet")
-
+            if k_col not in legacy_df.columns: missing.append(f"Key column '{k_col}' missing in PeopleSoft")
             o_key_col = mappings_dict.get(k_col, k_col)
-            if o_key_col not in oracle_df.columns:
-                 missing.append(f"Key column '{o_key_col}' missing in Oracle sheet")
+            if o_key_col not in oracle_df.columns: missing.append(f"Key column '{o_key_col}' missing in Oracle Cloud")
 
         if missing:
             raise HTTPException(status_code=400, detail={"errors": missing})
@@ -7898,10 +7889,7 @@ async def post_validation_excel(
         def generate_key(df, columns):
             return df[columns].astype(str).fillna("").agg('|'.join, axis=1)
 
-        # Legacy Key Generation
         legacy_df[INTERNAL_KEY] = generate_key(legacy_df, key_cols_list)
-
-        # Oracle Key Generation
         oracle_key_cols = [mappings_dict.get(k, k) for k in key_cols_list]
         oracle_df[INTERNAL_KEY] = generate_key(oracle_df, oracle_key_cols)
 
@@ -7909,37 +7897,30 @@ async def post_validation_excel(
         legacy_df = legacy_df.sort_values(by=INTERNAL_KEY).reset_index(drop=True)
         oracle_df = oracle_df.sort_values(by=INTERNAL_KEY).reset_index(drop=True)
 
+        # "Inconsistent" Rows (Missing in one side)
         legacy_only_df = legacy_df[~legacy_df[INTERNAL_KEY].isin(oracle_df[INTERNAL_KEY])].copy()
         oracle_only_df = oracle_df[~oracle_df[INTERNAL_KEY].isin(legacy_df[INTERNAL_KEY])].copy()
 
-        # --- [Merge Preparation] ---
+        # --- [Merge for Validation Discrepancies] ---
         legacy_map_keys = list(mappings_dict.keys())
         oracle_map_values = list(mappings_dict.values())
+        
+        val_legacy_cols = list(set(key_cols_list + included_cols_list + legacy_map_keys + [INTERNAL_KEY]))
+        val_oracle_cols = list(set(oracle_map_values + oracle_key_cols + [INTERNAL_KEY]))
+        
+        val_legacy_sel = legacy_df[val_legacy_cols].copy()
+        val_oracle_sel = oracle_df[val_oracle_cols].copy().rename(columns={v: k for k, v in mappings_dict.items()})
 
-        legacy_cols_to_fetch = list(set(key_cols_list + included_cols_list + legacy_map_keys + [INTERNAL_KEY]))
-        legacy_selected = legacy_df[legacy_cols_to_fetch].copy()
+        val_merged = pd.merge(val_legacy_sel, val_oracle_sel, on=INTERNAL_KEY, how="inner", suffixes=("_legacy", "_oracle"))
 
-        oracle_cols_to_fetch = list(set(oracle_map_values + oracle_key_cols + [INTERNAL_KEY]))
-        oracle_selected = oracle_df[oracle_cols_to_fetch].copy()
-
-        reverse_mapping = {v: k for k, v in mappings_dict.items()}
-        oracle_selected = oracle_selected.rename(columns=reverse_mapping)
-
-        merged_df = pd.merge(
-            legacy_selected, oracle_selected,
-            on=INTERNAL_KEY, how="inner", suffixes=("_legacy", "_oracle")
-        )
-
-        # --- [Row Comparison Logic] ---
         validation_rows = []
-
-        for _, row in merged_df.iterrows():
+        
+        for _, row in val_merged.iterrows():
             context_data = {}
             for k_col in key_cols_list:
                 val = row.get(k_col)
                 if val is None or pd.isna(val): val = row.get(f"{k_col}_legacy")
                 context_data[k_col] = str(val or "")
-
             for col in included_cols_list:
                 if col in key_cols_list: continue
                 val = row.get(col)
@@ -7958,19 +7939,90 @@ async def post_validation_excel(
                     col_name_str = f"{l_col} - {oracle_col_name}"
                     error_entry = context_data.copy()
                     error_entry["Column Name"] = col_name_str
-                    error_entry["Source Value"] = l_val
-                    error_entry["Target Value"] = o_val
+                    error_entry["PeopleSoft Value"] = l_val
+                    error_entry["Oracle Cloud Value"] = o_val
                     validation_rows.append(error_entry)
-
+            
         if validation_rows:
             validation_df = pd.DataFrame(validation_rows)
-            ordered_cols = key_cols_list + [c for c in included_cols_list if c not in key_cols_list] + ["Column Name", "Source Value", "Target Value"]
+            ordered_cols = key_cols_list + [c for c in included_cols_list if c not in key_cols_list] + ["Column Name", "PeopleSoft Value", "Oracle Cloud Value"]
             final_cols = [c for c in ordered_cols if c in validation_df.columns]
             validation_df = validation_df[final_cols]
         else:
             validation_df = pd.DataFrame([{"Status": "All mapped columns matched perfectly"}])
 
-        # --- [Remove Internal Key] ---
+        # --- [NEW: PeopleSoft - Oracle Cloud Data Sheet Generation] ---
+        
+        # 1. Consistent Data (Inner Join of ALL columns)
+        # We need a full merge of everything to get rows that exist in both
+        full_merged_consistent = pd.merge(
+            legacy_df, 
+            oracle_df, 
+            on=INTERNAL_KEY, 
+            how="inner", 
+            suffixes=('', '_OracleCloud')
+        )
+        
+        # 2. Inconsistent Data (Outer Join - Exclusive Rows)
+        # We already have legacy_only_df and oracle_only_df.
+        # We need to align their columns to match 'full_merged_consistent' for stacking.
+        
+        # Get column list from consistent merge to enforce structure
+        # Identify columns for ordering
+        ps_cols_in_merged = [c for c in legacy_df.columns if c != INTERNAL_KEY]
+        
+        oc_cols_in_merged = []
+        for c in oracle_df.columns:
+            if c == INTERNAL_KEY: continue
+            if c in ps_cols_in_merged:
+                oc_cols_in_merged.append(f"{c}_OracleCloud")
+            else:
+                oc_cols_in_merged.append(c)
+        
+        # Helper to align exclusive DFs to the full schema
+        def align_to_schema(df, is_oracle=False):
+            aligned = df.copy()
+            # If oracle, rename columns to match the suffix
+            if is_oracle:
+                rename_map = {}
+                for c in df.columns:
+                    if c == INTERNAL_KEY: continue
+                    if c in ps_cols_in_merged: # Collision with PS name
+                        rename_map[c] = f"{c}_OracleCloud"
+                aligned = aligned.rename(columns=rename_map)
+            
+            # Ensure all columns exist (fill missing with NaN/Empty)
+            target_cols = ps_cols_in_merged + oc_cols_in_merged
+            for col in target_cols:
+                if col not in aligned.columns:
+                    aligned[col] = "" # Fill missing side with empty strings
+            return aligned[target_cols]
+
+        inconsistent_part1 = align_to_schema(legacy_only_df, is_oracle=False)
+        inconsistent_part2 = align_to_schema(oracle_only_df, is_oracle=True)
+        
+        inconsistent_combined = pd.concat([inconsistent_part1, inconsistent_part2], ignore_index=True)
+
+        # 3. Create Divider Row
+        # Combine consistent + divider + inconsistent
+        # Divider has empty strings for all columns
+        full_cols = ps_cols_in_merged + oc_cols_in_merged
+        divider_row = pd.DataFrame([[""] * len(full_cols)], columns=full_cols)
+
+        # 4. Construct Final DataFrame
+        if not inconsistent_combined.empty:
+            final_combined_df = pd.concat([full_merged_consistent[full_cols], divider_row, inconsistent_combined], ignore_index=True)
+            divider_row_index = len(full_merged_consistent) + 2 # +2 for header and 1-based indexing
+        else:
+            final_combined_df = full_merged_consistent[full_cols]
+            divider_row_index = None
+
+        # 5. Add Visual Divider Column "||"
+        final_combined_df["||"] = ""
+        final_col_order = ps_cols_in_merged + ["||"] + oc_cols_in_merged
+        final_combined_df = final_combined_df[final_col_order]
+
+        # --- [Clean up exclusive DFs for individual sheets] ---
         if INTERNAL_KEY in legacy_only_df.columns: legacy_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
         if INTERNAL_KEY in oracle_only_df.columns: oracle_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
 
@@ -7980,22 +8032,20 @@ async def post_validation_excel(
         if "Status" not in validation_df.columns:
             total_discrepancies = len(validation_df)
 
-        # Adding spacer rows and data
-        # Structure: [Spacer, Label, Value] -> Corresponding to Excel Columns A, B, C
         summary_rows.append(["", "", ""]) 
-        summary_rows.append(["", "Source File Name", legacyFile.filename])
-        summary_rows.append(["", "Source Records Count", len(legacy_df)])
-        summary_rows.append(["", "Target File Name", oracleFile.filename])
-        summary_rows.append(["", "Target Records Count", len(oracle_df)])
+        summary_rows.append(["", "PeopleSoft File Name", legacyFile.filename])
+        summary_rows.append(["", "PeopleSoft Records Count", len(legacy_df)])
+        summary_rows.append(["", "Oracle Cloud File Name", oracleFile.filename])
+        summary_rows.append(["", "Oracle Cloud Records Count", len(oracle_df)])
         summary_rows.append(["", "UserID", userID])
         summary_rows.append(["", "Validation DateTime", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
         summary_rows.append(["", "", ""]) 
         summary_rows.append(["", "", ""]) 
         summary_rows.append(["", "Validation Summary", ""])
-        summary_rows.append(["", "Records Missing in Source File", len(legacy_only_df)])
-        summary_rows.append(["", "Records Missing in Target File", len(oracle_only_df)])
+        summary_rows.append(["", "Records Missing in PeopleSoft", len(legacy_only_df)])
+        summary_rows.append(["", "Records Missing in Oracle Cloud", len(oracle_only_df)])
         summary_rows.append(["", "Data Discrepancies", total_discrepancies])
-
+        
         if total_discrepancies > 0 and "Column Name" in validation_df.columns:
             breakdown = validation_df["Column Name"].value_counts()
             for col_name, count in breakdown.items():
@@ -8004,133 +8054,136 @@ async def post_validation_excel(
         summary_df = pd.DataFrame(summary_rows)
 
         # --- [Excel Generation & Styling] ---
+        sheet_missing_ps = "Missing in PeopleSoft"
+        sheet_missing_oc = "Missing in Oracle Cloud"
+        sheet_discrepancies = "Data Discrepancies"
+        sheet_full_data = "PeopleSoft - Oracle Cloud Data" 
+
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            # Write Data
             summary_df.to_excel(writer, index=False, header=False, sheet_name="Summary")
-            legacy_only_df.to_excel(writer, index=False, sheet_name="Records Missing in Source File")
-            oracle_only_df.to_excel(writer, index=False, sheet_name="Records Missing in Target File")
-            validation_df.to_excel(writer, index=False, sheet_name="Data Discrepancies")
+            legacy_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_ps)
+            oracle_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_oc)
+            validation_df.to_excel(writer, index=False, sheet_name=sheet_discrepancies)
+            final_combined_df.to_excel(writer, index=False, sheet_name=sheet_full_data)
 
             workbook = writer.book
             
-            # --- Define Styles ---
-            # Fonts: Calibri 9px (size=9)
+            # --- Styles ---
             font_main = Font(name='Calibri', size=9)
             font_white = Font(name='Calibri', size=9, color="FFFFFF")
             font_bold_white = Font(name='Calibri', size=9, color="FFFFFF", bold=True)
             
-            # Fills
             fill_green = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
-            
-            # Header Fills
-            fill_source_header = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
-            fill_target_header = PatternFill(start_color="31869B", end_color="31869B", fill_type="solid")
+            fill_ps_header = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
+            fill_oc_header = PatternFill(start_color="31869B", end_color="31869B", fill_type="solid")
             fill_disc_header = PatternFill(start_color="C0504D", end_color="C0504D", fill_type="solid")
-            
-            # Changed fill_yellow to the new color #FFFFCC
             fill_discrepancy_highlight = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
 
-            # Borders & Alignment
-            thin_border = Border(
-                left=Side(style='thin'), right=Side(style='thin'),
-                top=Side(style='thin'), bottom=Side(style='thin')
-            )
+            # NEW Styles
+            fill_grey_header = PatternFill(start_color="808080", end_color="808080", fill_type="solid") 
+            fill_blue_header = PatternFill(start_color="0070C0", end_color="0070C0", fill_type="solid") 
+            fill_black = PatternFill(start_color="000000", end_color="000000", fill_type="solid") 
+
+            thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             center_align = Alignment(horizontal="center", vertical="center")
             left_align = Alignment(horizontal="left", vertical="center", wrap_text=False)
 
-            # --- 1. Global: Font, Auto-Size Columns, and Alignment ---
-            # This iterates all sheets and all columns to set default width and alignment
+            # --- 1. Global Formatting ---
             for sheet in workbook.worksheets:
                 for col_idx, column_cells in enumerate(sheet.columns, 1):
                     max_length = 0
                     col_letter = get_column_letter(col_idx)
-                    
                     for cell in column_cells:
-                        # Apply Global Font & Alignment
                         cell.font = font_main
                         cell.alignment = left_align
-                        
-                        # Calculate Max Length
                         try:
                             if cell.value:
                                 length = len(str(cell.value))
-                                if length > max_length:
-                                    max_length = length
-                        except:
-                            pass
+                                if length > max_length: max_length = length
+                        except: pass
                     
-                    # Set Width (Approximate padding)
                     adjusted_width = (max_length + 2) * 1.2
-                    # Limit max width to prevent gigantic columns
                     if adjusted_width > 100: adjusted_width = 100
-                    # Minimum width ensures it's readable
                     if adjusted_width < 10: adjusted_width = 10
-                    
                     sheet.column_dimensions[col_letter].width = adjusted_width
 
-            # --- 2. Specific Sheet Header Styling ---
+            # --- 2. Header Styling (Standard Sheets) ---
             def style_header(sheet_name, fill_color):
                 if sheet_name in workbook.sheetnames:
                     ws = workbook[sheet_name]
                     for cell in ws[1]:
                         cell.fill = fill_color
-                        # Apply Bold White Font for Headers
                         cell.font = font_bold_white
-                        # Headers can remain left aligned as per Global, 
-                        # or explicitly change here if Center is preferred later.
 
-            # Apply specific colors and BOLD font to headers
-            style_header("Records Missing in Source File", fill_source_header)
-            style_header("Records Missing in Target File", fill_target_header)
-            style_header("Data Discrepancies", fill_disc_header)
+            style_header(sheet_missing_ps, fill_ps_header)
+            style_header(sheet_missing_oc, fill_oc_header)
+            style_header(sheet_discrepancies, fill_disc_header)
 
-            # --- 3. Summary Sheet Styling ---
+            # --- 3. New Sheet Styling ("PeopleSoft - Oracle Cloud Data") ---
+            if sheet_full_data in workbook.sheetnames:
+                ws_full = workbook[sheet_full_data]
+                
+                # Identify Column Indices
+                divider_col_idx = None
+                
+                # Header Styling (Row 1)
+                for cell in ws_full[1]:
+                    col_name = cell.value
+                    if col_name == "||":
+                        cell.fill = fill_black
+                        divider_col_idx = cell.column
+                    elif col_name in ps_cols_in_merged:
+                        cell.fill = fill_grey_header
+                        cell.font = font_bold_white
+                    else:
+                        cell.fill = fill_blue_header
+                        cell.font = font_bold_white
+                
+                # Divider Column Styling
+                if divider_col_idx:
+                    col_letter = get_column_letter(divider_col_idx)
+                    ws_full.column_dimensions[col_letter].width = 2 
+                    for row in ws_full.iter_rows(min_col=divider_col_idx, max_col=divider_col_idx):
+                        for cell in row:
+                            cell.fill = fill_black
+
+                # Divider Row Styling
+                if divider_row_index:
+                    ws_full.row_dimensions[divider_row_index].height = 5 
+                    for cell in ws_full[divider_row_index]:
+                        cell.fill = fill_black
+
+            # --- 4. Summary Sheet Styling ---
             ws_sum = workbook["Summary"]
-            ws_sum.sheet_view.showGridLines = False  # Hide gridlines
-            
+            ws_sum.sheet_view.showGridLines = False
             for row in ws_sum.iter_rows(min_row=1, max_row=ws_sum.max_row, min_col=2, max_col=3):
-                label_cell = row[0] # Column B
-                value_cell = row[1] # Column C
-
+                label_cell = row[0]
+                value_cell = row[1]
                 if label_cell.value:
-                    # Apply Green Background
                     label_cell.fill = fill_green
-                    
-                    # Apply Borders
                     label_cell.border = thin_border
                     value_cell.border = thin_border
-
-                    # Merge & Center for "Validation Summary"
                     if label_cell.value == "Validation Summary":
                         ws_sum.merge_cells(start_row=label_cell.row, start_column=2, end_row=label_cell.row, end_column=3)
-                        # This OVERRIDES the global left alignment
                         label_cell.alignment = center_align
-                        # Apply Bold White Font specifically here
                         label_cell.font = font_bold_white
                     else:
-                        # Apply standard White Font (non-bold) for other labels
                         label_cell.font = font_white
-                        
-                        # Center Align Numbers
                         if isinstance(value_cell.value, (int, float)):
                             value_cell.alignment = center_align
 
-            # --- 4. Style Data Discrepancies (Yellow Highlights) ---
-            ws_disc = workbook["Data Discrepancies"]
+            # --- 5. Discrepancy Highlight ---
+            ws_disc = workbook[sheet_discrepancies]
             if "Status" not in validation_df.columns:
-                source_idx = None
-                target_idx = None
-                # Find indices (1-based)
+                s_idx, t_idx = None, None
                 for col_idx in range(1, ws_disc.max_column + 1):
-                    header_val = ws_disc.cell(1, col_idx).value
-                    if header_val == "Source Value": source_idx = col_idx
-                    elif header_val == "Target Value": target_idx = col_idx
-
-                if source_idx and target_idx:
+                    val = ws_disc.cell(1, col_idx).value
+                    if val == "PeopleSoft Value": s_idx = col_idx
+                    elif val == "Oracle Cloud Value": t_idx = col_idx
+                if s_idx and t_idx:
                     for r in range(2, ws_disc.max_row + 1):
-                        # Apply new discrepancy highlight color
-                        ws_disc.cell(r, source_idx).fill = fill_discrepancy_highlight
-                        ws_disc.cell(r, target_idx).fill = fill_discrepancy_highlight
+                        ws_disc.cell(r, s_idx).fill = fill_discrepancy_highlight
+                        ws_disc.cell(r, t_idx).fill = fill_discrepancy_highlight
 
         # Cleanup
         def _clean(path):
@@ -8153,65 +8206,83 @@ async def post_validation_excel(
         print(f"Processing Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/extract-headers")
-async def extract_headers(file: UploadFile = File(...)):
+        
+@app.post("/get-sheets")
+async def get_sheets(file: UploadFile = File(...)):
     """
-    Reads an Excel file and returns the list of column headers.
+    Returns a list of all worksheet names in the Excel file.
     """
     try:
         contents = await file.read()
-        try:
-             df = pd.read_excel(io.BytesIO(contents), nrows=5, engine='openpyxl')
-        except:
-             file.file.seek(0)
-             contents = await file.read()
-             df = pd.read_excel(io.BytesIO(contents), nrows=5)
-             
+        # Use ExcelFile to read metadata without loading the entire dataframe
+        with io.BytesIO(contents) as bio:
+            xls = pd.ExcelFile(bio, engine='openpyxl')
+            return {"sheets": xls.sheet_names}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error reading sheets: {str(e)}")
+
+@app.post("/extract-headers")
+async def extract_headers(
+    file: UploadFile = File(...), 
+    sheet_name: str = Form(None) # Updated to accept sheet_name
+):
+    """
+    Reads headers from a specific sheet. 
+    If sheet_name is not provided, defaults to the first sheet.
+    """
+    try:
+        contents = await file.read()
+        with io.BytesIO(contents) as bio:
+            # Read only the first few rows for performance
+            if sheet_name:
+                df = pd.read_excel(bio, sheet_name=sheet_name, nrows=5, engine='openpyxl')
+            else:
+                df = pd.read_excel(bio, nrows=5, engine='openpyxl')
+                
         headers = df.columns.tolist()
         return {"headers": headers}
+    except ValueError as ve:
+         raise HTTPException(status_code=400, detail=f"Sheet '{sheet_name}' not found.")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error reading file headers: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error reading headers: {str(e)}")
 
 @app.post("/convert-excel")
 async def convert_excel(
     structure_file: UploadFile = File(...),
     target_file: UploadFile = File(...),
+    # New Sheet Parameters
+    structure_sheet: str = Form(None),
+    target_sheet: str = Form(None),
+    # Existing Mapping Parameters
     legacy_col: str = Form(...),
     oracle_col: str = Form(...),
-    attribute_col: str = Form(None), # Optional: Triggers Dynamic Mode
-    target_col: str = Form(None),    # Optional: Used only if Dynamic Mode is OFF
+    attribute_col: str = Form(None),
+    target_col: str = Form(None),
 ):
     """
-    Transforms the target_file using mapping rules from structure_file.
-    
-    DYNAMIC MODE (if attribute_col is provided):
-    - Iterates through ALL columns in target_file.
-    - If a column name matches a value in structure_file[attribute_col], 
-      it applies the specific mapping for that attribute.
-      
-    SINGLE COLUMN MODE (if attribute_col is None):
-    - Requires target_col.
-    - Transforms only that specific column using global mapping.
+    Transforms data using specific sheets for Structure and Target files.
     """
     try:
-        # 1. Read Structure File (The Map)
+        # 1. Read Structure File (Mapping Logic)
         structure_content = await structure_file.read()
         try:
-            df_structure = pd.read_excel(io.BytesIO(structure_content), engine='openpyxl')
-        except:
-            df_structure = pd.read_excel(io.BytesIO(structure_content))
+            # Load specific sheet if provided, else default (0)
+            sheet_arg = structure_sheet if structure_sheet else 0
+            df_structure = pd.read_excel(io.BytesIO(structure_content), sheet_name=sheet_arg, engine='openpyxl')
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error reading Structure file: {str(e)}")
 
-        # Validate columns exist
+        # Validate structure columns
         if legacy_col not in df_structure.columns or oracle_col not in df_structure.columns:
-            raise HTTPException(status_code=400, detail="Selected mapping columns not found in the Structure Excel file.")
+            raise HTTPException(status_code=400, detail="Selected mapping columns not found in Structure sheet.")
 
-        # 2. Read Target File (The Data)
+        # 2. Read Target File (Data to Transform)
         target_content = await target_file.read()
         try:
-            df_target = pd.read_excel(io.BytesIO(target_content), engine='openpyxl')
-        except:
-            df_target = pd.read_excel(io.BytesIO(target_content))
+            sheet_arg = target_sheet if target_sheet else 0
+            df_target = pd.read_excel(io.BytesIO(target_content), sheet_name=sheet_arg, engine='openpyxl')
+        except Exception as e:
+             raise HTTPException(status_code=400, detail=f"Error reading Target file: {str(e)}")
 
         transform_log = []
 
@@ -8221,7 +8292,6 @@ async def convert_excel(
             # Normalize attribute column for matching
             df_structure[attribute_col] = df_structure[attribute_col].astype(str).str.strip()
             
-            # Iterate through every column in the target file
             for col in df_target.columns:
                 col_name = str(col).strip()
                 
@@ -8234,17 +8304,11 @@ async def convert_excel(
                     mapping = dict(zip(subset[legacy_col], subset[oracle_col]))
                     
                     # Apply Map
-                    # Convert to string to ensure mapping works (handling type mismatches)
-                    # Use map().fillna() to keep original values if no match found
                     df_target[col] = df_target[col].map(mapping).fillna(df_target[col])
                     transform_log.append(col_name)
 
-            if not transform_log:
-                # Warning if no columns matched, but we still return the file
-                print("Warning: No matching columns found in target file based on Attribute names.")
-
         else:
-            # === SINGLE COLUMN MODE (Fallback) ===
+            # === SINGLE COLUMN MODE ===
             if not target_col:
                 raise HTTPException(status_code=400, detail="Target column must be specified if Attribute column is not used.")
             
@@ -8253,7 +8317,7 @@ async def convert_excel(
                 mapping_dict = dict(zip(mapping_df[legacy_col], mapping_df[oracle_col]))
                 df_target[target_col] = df_target[target_col].map(mapping_dict).fillna(df_target[target_col])
             else:
-                 raise HTTPException(status_code=400, detail=f"Column '{target_col}' not found in the Target file.")
+                 raise HTTPException(status_code=400, detail=f"Column '{target_col}' not found in Target sheet.")
 
         # 3. Save to Buffer
         output = io.BytesIO()
