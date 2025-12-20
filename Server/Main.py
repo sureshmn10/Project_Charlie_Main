@@ -7829,8 +7829,8 @@ async def post_validation_excel(
     """
     Post-validation endpoint.
     Updated Logic:
-    - Consistent = Rows in BOTH files.
-    - Inconsistent = Rows in ONLY PeopleSoft + Rows in ONLY Oracle Cloud.
+    - Summary sheet reordered: Breakdown first, then Total Discrepancies, then Grand Total.
+    - Removed horizontal divider row in the combined data sheet.
     """
 
     temp_dir = tempfile.mkdtemp()
@@ -7954,7 +7954,6 @@ async def post_validation_excel(
         # --- [NEW: PeopleSoft - Oracle Cloud Data Sheet Generation] ---
         
         # 1. Consistent Data (Inner Join of ALL columns)
-        # We need a full merge of everything to get rows that exist in both
         full_merged_consistent = pd.merge(
             legacy_df, 
             oracle_df, 
@@ -7964,11 +7963,6 @@ async def post_validation_excel(
         )
         
         # 2. Inconsistent Data (Outer Join - Exclusive Rows)
-        # We already have legacy_only_df and oracle_only_df.
-        # We need to align their columns to match 'full_merged_consistent' for stacking.
-        
-        # Get column list from consistent merge to enforce structure
-        # Identify columns for ordering
         ps_cols_in_merged = [c for c in legacy_df.columns if c != INTERNAL_KEY]
         
         oc_cols_in_merged = []
@@ -7979,23 +7973,20 @@ async def post_validation_excel(
             else:
                 oc_cols_in_merged.append(c)
         
-        # Helper to align exclusive DFs to the full schema
         def align_to_schema(df, is_oracle=False):
             aligned = df.copy()
-            # If oracle, rename columns to match the suffix
             if is_oracle:
                 rename_map = {}
                 for c in df.columns:
                     if c == INTERNAL_KEY: continue
-                    if c in ps_cols_in_merged: # Collision with PS name
+                    if c in ps_cols_in_merged:
                         rename_map[c] = f"{c}_OracleCloud"
                 aligned = aligned.rename(columns=rename_map)
             
-            # Ensure all columns exist (fill missing with NaN/Empty)
             target_cols = ps_cols_in_merged + oc_cols_in_merged
             for col in target_cols:
                 if col not in aligned.columns:
-                    aligned[col] = "" # Fill missing side with empty strings
+                    aligned[col] = "" 
             return aligned[target_cols]
 
         inconsistent_part1 = align_to_schema(legacy_only_df, is_oracle=False)
@@ -8003,34 +7994,31 @@ async def post_validation_excel(
         
         inconsistent_combined = pd.concat([inconsistent_part1, inconsistent_part2], ignore_index=True)
 
-        # 3. Create Divider Row
-        # Combine consistent + divider + inconsistent
-        # Divider has empty strings for all columns
+        # 3. Construct Final DataFrame (REMOVED DIVIDER ROW)
         full_cols = ps_cols_in_merged + oc_cols_in_merged
-        divider_row = pd.DataFrame([[""] * len(full_cols)], columns=full_cols)
-
-        # 4. Construct Final DataFrame
+        
         if not inconsistent_combined.empty:
-            final_combined_df = pd.concat([full_merged_consistent[full_cols], divider_row, inconsistent_combined], ignore_index=True)
-            divider_row_index = len(full_merged_consistent) + 2 # +2 for header and 1-based indexing
+            final_combined_df = pd.concat([full_merged_consistent[full_cols], inconsistent_combined], ignore_index=True)
         else:
             final_combined_df = full_merged_consistent[full_cols]
-            divider_row_index = None
 
-        # 5. Add Visual Divider Column "||"
+        # 4. Add Visual Divider Column "||"
         final_combined_df["||"] = ""
         final_col_order = ps_cols_in_merged + ["||"] + oc_cols_in_merged
         final_combined_df = final_combined_df[final_col_order]
 
-        # --- [Clean up exclusive DFs for individual sheets] ---
+        # --- [Clean up exclusive DFs] ---
         if INTERNAL_KEY in legacy_only_df.columns: legacy_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
         if INTERNAL_KEY in oracle_only_df.columns: oracle_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
 
-        # --- [Generate Summary Data] ---
+        # --- [Generate Summary Data - REORDERED] ---
         summary_rows = []
         total_discrepancies = 0
         if "Status" not in validation_df.columns:
             total_discrepancies = len(validation_df)
+
+        count_missing_ps = len(legacy_only_df)
+        count_missing_oc = len(oracle_only_df)
 
         summary_rows.append(["", "", ""]) 
         summary_rows.append(["", "PeopleSoft File Name", legacyFile.filename])
@@ -8042,14 +8030,24 @@ async def post_validation_excel(
         summary_rows.append(["", "", ""]) 
         summary_rows.append(["", "", ""]) 
         summary_rows.append(["", "Validation Summary", ""])
-        summary_rows.append(["", "Records Missing in PeopleSoft", len(legacy_only_df)])
-        summary_rows.append(["", "Records Missing in Oracle Cloud", len(oracle_only_df)])
-        summary_rows.append(["", "Data Discrepancies", total_discrepancies])
         
+        
+        # 1. Breakdown of Data Discrepancies
         if total_discrepancies > 0 and "Column Name" in validation_df.columns:
             breakdown = validation_df["Column Name"].value_counts()
             for col_name, count in breakdown.items():
                 summary_rows.append(["", col_name, count])
+                        
+        # 2. Missing Counts
+        summary_rows.append(["", "Records Missing in PeopleSoft", count_missing_ps])
+        summary_rows.append(["", "Records Missing in Oracle Cloud", count_missing_oc])
+
+        # 3. Total Discrepancies (Moved to bottom)
+        summary_rows.append(["", "Total Data Discrepancies", total_discrepancies])
+
+        # 4. Grand Total (Summing up all numbers)
+        grand_total = count_missing_ps + count_missing_oc + total_discrepancies
+        summary_rows.append(["", "Total Validation Issues", grand_total])
 
         summary_df = pd.DataFrame(summary_rows)
 
@@ -8072,17 +8070,17 @@ async def post_validation_excel(
             font_main = Font(name='Calibri', size=9)
             font_white = Font(name='Calibri', size=9, color="FFFFFF")
             font_bold_white = Font(name='Calibri', size=9, color="FFFFFF", bold=True)
+            font_bold_black = Font(name='Calibri', size=9, bold=True) # New style for totals
             
             fill_green = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
             fill_ps_header = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
             fill_oc_header = PatternFill(start_color="31869B", end_color="31869B", fill_type="solid")
             fill_disc_header = PatternFill(start_color="C0504D", end_color="C0504D", fill_type="solid")
             fill_discrepancy_highlight = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
-
-            # NEW Styles
             fill_grey_header = PatternFill(start_color="808080", end_color="808080", fill_type="solid") 
             fill_blue_header = PatternFill(start_color="0070C0", end_color="0070C0", fill_type="solid") 
-            fill_black = PatternFill(start_color="000000", end_color="000000", fill_type="solid") 
+            fill_blue = PatternFill(start_color="6495ED", end_color="6495ED", fill_type="solid") 
+            fill_total_grey = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid") # New fill for total
 
             thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             center_align = Alignment(horizontal="center", vertical="center")
@@ -8107,7 +8105,7 @@ async def post_validation_excel(
                     if adjusted_width < 10: adjusted_width = 10
                     sheet.column_dimensions[col_letter].width = adjusted_width
 
-            # --- 2. Header Styling (Standard Sheets) ---
+            # --- 2. Header Styling ---
             def style_header(sheet_name, fill_color):
                 if sheet_name in workbook.sheetnames:
                     ws = workbook[sheet_name]
@@ -8119,18 +8117,14 @@ async def post_validation_excel(
             style_header(sheet_missing_oc, fill_oc_header)
             style_header(sheet_discrepancies, fill_disc_header)
 
-            # --- 3. New Sheet Styling ("PeopleSoft - Oracle Cloud Data") ---
+            # --- 3. Combined Data Sheet Styling ---
             if sheet_full_data in workbook.sheetnames:
                 ws_full = workbook[sheet_full_data]
-                
-                # Identify Column Indices
                 divider_col_idx = None
-                
-                # Header Styling (Row 1)
                 for cell in ws_full[1]:
                     col_name = cell.value
                     if col_name == "||":
-                        cell.fill = fill_black
+                        cell.fill = fill_blue
                         divider_col_idx = cell.column
                     elif col_name in ps_cols_in_merged:
                         cell.fill = fill_grey_header
@@ -8139,35 +8133,37 @@ async def post_validation_excel(
                         cell.fill = fill_blue_header
                         cell.font = font_bold_white
                 
-                # Divider Column Styling
                 if divider_col_idx:
                     col_letter = get_column_letter(divider_col_idx)
                     ws_full.column_dimensions[col_letter].width = 2 
                     for row in ws_full.iter_rows(min_col=divider_col_idx, max_col=divider_col_idx):
                         for cell in row:
-                            cell.fill = fill_black
+                            cell.fill = fill_blue
 
-                # Divider Row Styling
-                if divider_row_index:
-                    ws_full.row_dimensions[divider_row_index].height = 5 
-                    for cell in ws_full[divider_row_index]:
-                        cell.fill = fill_black
-
-            # --- 4. Summary Sheet Styling ---
+            # --- 4. Summary Sheet Styling (Updated for Totals) ---
             ws_sum = workbook["Summary"]
             ws_sum.sheet_view.showGridLines = False
             for row in ws_sum.iter_rows(min_row=1, max_row=ws_sum.max_row, min_col=2, max_col=3):
                 label_cell = row[0]
                 value_cell = row[1]
                 if label_cell.value:
-                    label_cell.fill = fill_green
                     label_cell.border = thin_border
                     value_cell.border = thin_border
+                    
                     if label_cell.value == "Validation Summary":
+                        label_cell.fill = fill_green
                         ws_sum.merge_cells(start_row=label_cell.row, start_column=2, end_row=label_cell.row, end_column=3)
                         label_cell.alignment = center_align
                         label_cell.font = font_bold_white
+                    elif label_cell.value == "Total Validation Issues":
+                        # Highlight the grand total
+                        label_cell.fill = fill_total_grey
+                        value_cell.fill = fill_total_grey
+                        label_cell.font = font_bold_black
+                        value_cell.font = font_bold_black
+                        value_cell.alignment = center_align
                     else:
+                        label_cell.fill = fill_green
                         label_cell.font = font_white
                         if isinstance(value_cell.value, (int, float)):
                             value_cell.alignment = center_align
@@ -8205,7 +8201,6 @@ async def post_validation_excel(
     except Exception as e:
         print(f"Processing Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
         
 @app.post("/get-sheets")
 async def get_sheets(file: UploadFile = File(...)):
