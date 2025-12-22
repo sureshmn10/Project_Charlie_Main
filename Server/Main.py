@@ -8341,14 +8341,20 @@ async def convert_excel(
 async def get_finance_menu_items():
     """
     Returns a list of predefined menu items for PeopleSoft Finance.
-    return {
-        "menu_items": [
-            {"name": "General Ledger", "id": "GL"},
-            {"name": "Accounts Payable", "id": "AP"},
-            {"name": "Accounts Receivable", "id": "AR"},
-            {"name": "Payroll", "id": "PY"},
-            {"name": "Fixed Assets", "id": "FA"}
-        ]
-    }
+    returns the json file content as is.
     """
+    try:
+        menu_file_path = Path("Required_files/finance_menu_items.json")
+        with open(menu_file_path, "r") as f:
+            menu_items = json.load(f)
+            final = {
+                "status": 200,
+                "menu_items": menu_items
+            }
+        return final
+    except Exception as e:
+        return JSONResponse(
+            content={"error": f"Failed to load menu items: {str(e)}"},
+            status_code=500,
+        )
     
