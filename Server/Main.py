@@ -432,7 +432,7 @@ async def login_access(user_login: UserLogin):
         )
 
 ENV_PATH = Path(".env")
-@app.get("/api/utils/menu-items")
+@app.get("/api/utils/hdl/menu-items")
 def get_hierarchy_api():
     # Validate Excel path
     if not EXCEL_FILE_PATH.exists():
@@ -7692,7 +7692,7 @@ async def get_excel_sheets(
             status_code=500,
         )
     
-GOOGLE_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyBTrQKaRXl-pYpcfLj0JGYQFHLg0hHtX_c')
+GOOGLE_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyCIW04m6wCb4u1W2aCjcS7QCq_RTHcHIhE')
 genai.configure(api_key=GOOGLE_API_KEY)
 
 def get_smart_mapping_from_gemini(legacy_cols: List[str], oracle_cols: List[str]) -> Dict[str, str]:
@@ -8331,3 +8331,24 @@ async def convert_excel(
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Transformation failed: {str(e)}")
+    
+
+
+# ---PeopleSoft Finance
+
+
+@app.get("/api/utils/finance/menu-items")
+async def get_finance_menu_items():
+    """
+    Returns a list of predefined menu items for PeopleSoft Finance.
+    return {
+        "menu_items": [
+            {"name": "General Ledger", "id": "GL"},
+            {"name": "Accounts Payable", "id": "AP"},
+            {"name": "Accounts Receivable", "id": "AR"},
+            {"name": "Payroll", "id": "PY"},
+            {"name": "Fixed Assets", "id": "FA"}
+        ]
+    }
+    """
+    
