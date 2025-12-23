@@ -8344,8 +8344,9 @@ async def post_validation_excel(
             # --- Discrepancy Highlight ---
             ws_disc = workbook[sheet_discrepancies]
             # --- Enable Filter for Data Discrepancies Sheet ---
-            ws_disc.auto_filter.ref = ws_disc.dimensions
-
+            if "Status" not in validation_df.columns:
+                ws_disc.auto_filter.ref = ws_disc.dimensions
+                
             if "Status" not in validation_df.columns:
                 ps_idx = oc_idx = None
                 for c in range(1, ws_disc.max_column + 1):
