@@ -7810,6 +7810,52 @@ async def get_excel_columns_mapping(
             status_code=500,
         )
 
+import re
+from dateutil import parser
+
+ORACLE_MIN_YEAR = -4712
+ORACLE_MAX_YEAR = 9999
+
+def normalize_dates(df, explicit_cols):
+    def safe_parse(val):
+        if pd.isna(val) or str(val).strip() == "":
+            return ""
+
+        val_str = str(val).strip()
+
+        # Excel serial date handling
+        if re.fullmatch(r"\d{5,}", val_str):
+            try:
+                return pd.to_datetime(float(val), unit="d", origin="1899-12-30") \
+                         .strftime("%Y/%m/%d")
+            except:
+                return ""
+
+        try:
+            dt = parser.parse(
+                val_str,
+                dayfirst=True,
+                yearfirst=False,
+                fuzzy=True
+            )
+
+            year = dt.year
+
+            # Oracle year boundaries
+            if year < ORACLE_MIN_YEAR or year > ORACLE_MAX_YEAR:
+                return ""
+
+            return f"{year:04d}/{dt.month:02d}/{dt.day:02d}"
+
+        except Exception:
+            # Final fallback: keep original string (Oracle may still accept)
+            return val_str
+
+    for col in df.columns:
+        if col in explicit_cols or pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].apply(safe_parse)
+
+    return df
 
 @app.post("/api/excel/post_validation/validate")
 async def post_validation_excel(
@@ -7824,6 +7870,8 @@ async def post_validation_excel(
     userID: str = Form(default="System"),
     dateColumns: str = Form(default="[]"),
     timestampColumns: str = Form(default="[]"),
+    dateColumnstarget: str = Form(default="[]"),
+    timestampColumnstarget: str = Form(default="[]"),
     # Compatibility args
     legacySheet: str = Form(default=""),
     oracleSheet: str = Form(default=""),
@@ -7865,7 +7913,10 @@ async def post_validation_excel(
             date_cols_list = json.loads(dateColumns)
             timestamp_cols_list = json.loads(timestampColumns)
             # Combine for explicit lookup
-            target_date_cols = set(date_cols_list + timestamp_cols_list)
+            legacy_date_cols = set(date_cols_list + timestamp_cols_list)
+            target_date_list = json.loads(dateColumnstarget)
+            target_timestamp_list = json.loads(timestampColumnstarget)
+            target_date_cols = set(target_date_list + target_timestamp_list)
         except Exception as ex:
             print(f"Warning parsing date columns: {ex}")
             target_date_cols = set()
@@ -7885,28 +7936,50 @@ async def post_validation_excel(
         except Exception as e:
              raise HTTPException(status_code=400, detail=f"Error reading Oracle Cloud file: {str(e)}")
 
-        # --- [3. Date Normalization Logic] ---
-        def normalize_dates(df, explicit_cols):
-            for col in df.columns:
-                # Check 1: Is this column explicitly defined by user as a date/timestamp?
-                is_explicit = col in explicit_cols
-                
-                # Check 2: Did Pandas automatically detect it as a datetime object?
-                is_detected = pd.api.types.is_datetime64_any_dtype(df[col])
+        ORACLE_MIN_YEAR = -4712
+        ORACLE_MAX_YEAR = 9999
 
-                if is_explicit or is_detected:
+        def normalize_dates(df, explicit_cols):
+
+            def safe_parse(val):
+                if pd.isna(val) or str(val).strip() == "":
+                    return ""
+
+                val_str = str(val).strip()
+
+                # Excel serial number dates (e.g. 45234)
+                if re.fullmatch(r"\d{5,}", val_str):
                     try:
-                        # Coerce to datetime (handles mixed formats)
-                        # errors='coerce' turns non-dates into NaT
-                        # dt.strftime('%Y/%m/%d') formats it to YYYY/MM/DD
-                        df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y/%m/%d')
-                        # Replace NaT/NaN (failed conversions or empty cells) with empty string
-                        df[col] = df[col].fillna("") 
-                    except Exception as e:
-                        print(f"Skipping date conversion for column {col}: {e}")
+                        dt = pd.to_datetime(float(val), unit="d", origin="1899-12-30")
+                        return f"{dt.year:04d}/{dt.month:02d}/{dt.day:02d}"
+                    except:
+                        return ""
+
+                try:
+                    dt = parser.parse(
+                        val_str,
+                        dayfirst=True,
+                        yearfirst=False,
+                        fuzzy=True
+                    )
+
+                    year = dt.year
+                    if year < ORACLE_MIN_YEAR or year > ORACLE_MAX_YEAR:
+                        return ""
+
+                    return f"{year:04d}/{dt.month:02d}/{dt.day:02d}"
+
+                except Exception:
+                    # Last-resort fallback: keep original (Oracle may still accept)
+                    return val_str
+
+            for col in df.columns:
+                if col in explicit_cols or pd.api.types.is_datetime64_any_dtype(df[col]):
+                    df[col] = df[col].apply(safe_parse)
+
             return df
 
-        legacy_df = normalize_dates(legacy_df, target_date_cols)
+        legacy_df = normalize_dates(legacy_df, legacy_date_cols)
         oracle_df = normalize_dates(oracle_df, target_date_cols)
 
         # --- [4. Validation Checks] ---
@@ -8241,6 +8314,9 @@ async def post_validation_excel(
     except Exception as e:
         print(f"Processing Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
 
 @app.post("/get-sheets")
 async def get_sheets(file: UploadFile = File(...)):
