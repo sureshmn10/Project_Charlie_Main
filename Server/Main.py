@@ -8059,19 +8059,26 @@ async def post_validation_excel(
 
             for l_col in legacy_map_keys:
                 if l_col in key_cols_list: continue
-                l_val = normalize_value(row.get(f"{l_col}_legacy", ""))
-                if l_val == "nan": l_val = ""
-                o_val = normalize_value(row.get(f"{l_col}_oracle", ""))
-                if o_val == "nan": o_val = ""
+                raw_l_val = row.get(f"{l_col}_legacy", "")
+                cmp_l_val = normalize_value(raw_l_val)
+                if cmp_l_val == "nan": cmp_l_val = ""
+                raw_o_val = row.get(f"{l_col}_oracle", "")
+                cmp_o_val = normalize_value(raw_o_val)
+                if cmp_o_val == "nan": cmp_o_val = ""
 
-                if l_val != o_val:
+                if cmp_l_val != cmp_o_val:
                     oracle_col_name = mappings_dict[l_col]
                     col_name_str = f"{l_col} - {oracle_col_name}"
+
                     error_entry = context_data.copy()
-                    error_entry["Field Name"] = col_name_str
-                    error_entry["PeopleSoft Value"] = l_val
-                    error_entry["Oracle Cloud Value"] = o_val
+                    error_entry["Column Name"] = col_name_str
+
+                    # 🔥 ORIGINAL VALUES — case preserved
+                    error_entry["PeopleSoft Value"] = "" if pd.isna(raw_l_val) else str(raw_l_val)
+                    error_entry["Oracle Cloud Value"] = "" if pd.isna(raw_o_val) else str(raw_o_val)
+
                     validation_rows.append(error_entry)
+
             
         if validation_rows:
             validation_df = pd.DataFrame(validation_rows)
@@ -8158,9 +8165,9 @@ async def post_validation_excel(
         # --- Comparison Statistics ---
         summary_rows.append(["", "Comparison Statistics", ""])
         summary_rows.append(["", "PeopleSoft File Name", legacyFile.filename])
-        summary_rows.append(["", "PeopleSoft Records Count", len(oracle_df)])
+        summary_rows.append(["", "PeopleSoft Records Count", len(legacy_df)])
         summary_rows.append(["", "Oracle Cloud File Name", oracleFile.filename])
-        summary_rows.append(["", "Oracle Cloud Records Count", len(legacy_df)])
+        summary_rows.append(["", "Oracle Cloud Records Count", len(oracle_df)])
         summary_rows.append(["", "Validation DateTime", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
         summary_rows.append(["", "", ""])
 
