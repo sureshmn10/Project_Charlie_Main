@@ -7983,6 +7983,26 @@ async def post_validation_excel(
         oracle_df = normalize_dates(oracle_df, target_date_cols)
 
         # --- [4. Validation Checks] ---
+        def normalize_value(val):
+            if val is None or pd.isna(val):
+                return ""
+
+            val = str(val).strip()
+
+            if val.lower() in ["nan", "none"]:
+                return ""
+
+            # Try numeric normalization
+            try:
+                num = float(val)
+                if num.is_integer():
+                    return str(int(num))
+                return str(num)
+            except:
+                # Text normalization (case-insensitive, trim)
+                return val.lower()
+
+
         missing = []
         for l, o in mappings_dict.items():
             if l not in legacy_df.columns: missing.append(f"PeopleSoft column '{l}' not found")
@@ -8039,9 +8059,9 @@ async def post_validation_excel(
 
             for l_col in legacy_map_keys:
                 if l_col in key_cols_list: continue
-                l_val = str(row.get(f"{l_col}_legacy", "")).strip()
+                l_val = normalize_value(row.get(f"{l_col}_legacy", ""))
                 if l_val == "nan": l_val = ""
-                o_val = str(row.get(f"{l_col}_oracle", "")).strip()
+                o_val = normalize_value(row.get(f"{l_col}_oracle", ""))
                 if o_val == "nan": o_val = ""
 
                 if l_val != o_val:
@@ -8127,6 +8147,7 @@ async def post_validation_excel(
 
         # --- [11. Generate Summary Data] ---
         summary_rows = []
+
         total_discrepancies = 0
         if "Status" not in validation_df.columns:
             total_discrepancies = len(validation_df)
@@ -8134,32 +8155,34 @@ async def post_validation_excel(
         count_missing_ps = len(legacy_only_df)
         count_missing_oc = len(oracle_only_df)
 
-        summary_rows.append(["", "", ""]) 
+        # --- Comparison Statistics ---
+        summary_rows.append(["", "Comparison Statistics", ""])
         summary_rows.append(["", "PeopleSoft File Name", legacyFile.filename])
         summary_rows.append(["", "PeopleSoft Records Count", len(legacy_df)])
         summary_rows.append(["", "Oracle Cloud File Name", oracleFile.filename])
         summary_rows.append(["", "Oracle Cloud Records Count", len(oracle_df)])
-        summary_rows.append(["", "UserID", userID])
         summary_rows.append(["", "Validation DateTime", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-        summary_rows.append(["", "", ""]) 
-        summary_rows.append(["", "", ""]) 
-        summary_rows.append(["", "Validation Summary", ""])
-        
-        
-        # 1. Breakdown of Data Discrepancies
+        summary_rows.append(["", "", ""])
+
+        # --- Missing Records Summary ---
+        summary_rows.append(["", "Missing Records Summary", ""])
+        summary_rows.append(["", "Records Missing in PeopleSoft", count_missing_ps])
+        summary_rows.append(["", "Records Missing in Oracle Cloud", count_missing_oc])
+        summary_rows.append(["", "Total Missing Records", count_missing_ps + count_missing_oc])
+        summary_rows.append(["", "", ""])
+
+        # --- Data Discrepancies Summary ---
+        summary_rows.append(["", "Data Discrepancies Summary", ""])
+
         if total_discrepancies > 0 and "Column Name" in validation_df.columns:
             breakdown = validation_df["Column Name"].value_counts()
             for col_name, count in breakdown.items():
                 summary_rows.append(["", col_name, count])
-                        
-        # 2. Missing Counts
-        summary_rows.append(["", "Records Missing in PeopleSoft", count_missing_ps])
-        summary_rows.append(["", "Records Missing in Oracle Cloud", count_missing_oc])
 
-        # 3. Total Discrepancies (Moved to bottom)
         summary_rows.append(["", "Total Data Discrepancies", total_discrepancies])
+        summary_rows.append(["", "", ""])
 
-        # 4. Grand Total
+        # --- Grand Total ---
         grand_total = count_missing_ps + count_missing_oc + total_discrepancies
         summary_rows.append(["", "Total Validation Issues", grand_total])
 
@@ -8169,130 +8192,159 @@ async def post_validation_excel(
         sheet_missing_ps = "Missing in PeopleSoft"
         sheet_missing_oc = "Missing in Oracle Cloud"
         sheet_discrepancies = "Data Discrepancies"
-        sheet_full_data = "PeopleSoft - Oracle Cloud Data" 
+        sheet_full_data = "PeopleSoft - Oracle Cloud Data"
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             summary_df.to_excel(writer, index=False, header=False, sheet_name="Summary")
-            legacy_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_ps)
-            oracle_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_oc)
+            oracle_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_ps)
+            legacy_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_oc)
             validation_df.to_excel(writer, index=False, sheet_name=sheet_discrepancies)
             final_combined_df.to_excel(writer, index=False, sheet_name=sheet_full_data)
 
             workbook = writer.book
-            
-            # --- Styles ---
-            font_main = Font(name='Calibri', size=9)
-            font_white = Font(name='Calibri', size=9, color="FFFFFF")
-            font_bold_white = Font(name='Calibri', size=9, color="FFFFFF", bold=True)
-            font_bold_black = Font(name='Calibri', size=9, bold=True)
-            
-            fill_green = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
-            fill_ps_header = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
-            fill_oc_header = PatternFill(start_color="31869B", end_color="31869B", fill_type="solid")
-            fill_disc_header = PatternFill(start_color="C0504D", end_color="C0504D", fill_type="solid")
-            fill_discrepancy_highlight = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
-            fill_grey_header = PatternFill(start_color="808080", end_color="808080", fill_type="solid") 
-            fill_blue_header = PatternFill(start_color="0070C0", end_color="0070C0", fill_type="solid") 
-            fill_blue = PatternFill(start_color="6495ED", end_color="6495ED", fill_type="solid") 
-            fill_total_grey = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
 
-            thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+            # --- Fonts ---
+            font_main = Font(name="Calibri", size=9)
+            font_white = Font(name="Calibri", size=9, color="FFFFFF")
+            font_bold_white = Font(name="Calibri", size=9, color="FFFFFF", bold=True)
+            font_bold_black = Font(name="Calibri", size=9, bold=True)
+
+            # --- Fills ---
+            fill_green = PatternFill("solid", fgColor="00B050")
+            fill_total_grey = PatternFill("solid", fgColor="D9D9D9")
+            fill_ps_header = PatternFill("solid", fgColor="1F497D")
+            fill_oc_header = PatternFill("solid", fgColor="31869B")
+            fill_disc_header = PatternFill("solid", fgColor="C0504D")
+            fill_blue_header = PatternFill("solid", fgColor="0070C0")
+            fill_grey_header = PatternFill("solid", fgColor="808080")
+            fill_blue = PatternFill("solid", fgColor="6495ED")
+            fill_discrepancy_highlight = PatternFill("solid", fgColor="FFFFCC")
+
+            # --- Borders & Alignment ---
+            thin_border = Border(
+                left=Side(style="thin"),
+                right=Side(style="thin"),
+                top=Side(style="thin"),
+                bottom=Side(style="thin")
+            )
+
+            left_align = Alignment(horizontal="left", vertical="center")
             center_align = Alignment(horizontal="center", vertical="center")
-            left_align = Alignment(horizontal="left", vertical="center", wrap_text=False)
 
             # --- Global Formatting ---
             for sheet in workbook.worksheets:
-                for col_idx, column_cells in enumerate(sheet.columns, 1):
-                    max_length = 0
+                for col_idx, col in enumerate(sheet.columns, 1):
+                    max_len = 0
                     col_letter = get_column_letter(col_idx)
-                    for cell in column_cells:
+                    for cell in col:
                         cell.font = font_main
                         cell.alignment = left_align
-                        try:
-                            if cell.value:
-                                length = len(str(cell.value))
-                                if length > max_length: max_length = length
-                        except: pass
-                    
-                    adjusted_width = (max_length + 2) * 1.2
-                    if adjusted_width > 100: adjusted_width = 100
-                    if adjusted_width < 10: adjusted_width = 10
-                    sheet.column_dimensions[col_letter].width = adjusted_width
+                        if cell.value:
+                            max_len = max(max_len, len(str(cell.value)))
+                    sheet.column_dimensions[col_letter].width = min(max((max_len + 2) * 1.2, 10), 100)
 
-            # --- Header Styling ---
-            def style_header(sheet_name, fill_color):
+            # --- Header Styling Helper ---
+            def style_header(sheet_name, fill):
                 if sheet_name in workbook.sheetnames:
                     ws = workbook[sheet_name]
                     for cell in ws[1]:
-                        cell.fill = fill_color
+                        cell.fill = fill
                         cell.font = font_bold_white
+                        cell.alignment = center_align
 
             style_header(sheet_missing_ps, fill_ps_header)
             style_header(sheet_missing_oc, fill_oc_header)
             style_header(sheet_discrepancies, fill_disc_header)
 
             # --- Combined Data Sheet Styling ---
-            if sheet_full_data in workbook.sheetnames:
-                ws_full = workbook[sheet_full_data]
-                divider_col_idx = None
-                for cell in ws_full[1]:
-                    col_name = cell.value
-                    if col_name == "||":
+            ws_full = workbook[sheet_full_data]
+            divider_col = None
+
+            for cell in ws_full[1]:
+                if cell.value == "||":
+                    divider_col = cell.column
+                    cell.fill = fill_blue
+                elif cell.value in ps_cols_in_merged:
+                    cell.fill = fill_grey_header
+                    cell.font = font_bold_white
+                else:
+                    cell.fill = fill_blue_header
+                    cell.font = font_bold_white
+
+            if divider_col:
+                col_letter = get_column_letter(divider_col)
+                ws_full.column_dimensions[col_letter].width = 2
+                for row in ws_full.iter_rows(min_col=divider_col, max_col=divider_col):
+                    for cell in row:
                         cell.fill = fill_blue
-                        divider_col_idx = cell.column
-                    elif col_name in ps_cols_in_merged:
-                        cell.fill = fill_grey_header
-                        cell.font = font_bold_white
-                    else:
-                        cell.fill = fill_blue_header
-                        cell.font = font_bold_white
-                
-                if divider_col_idx:
-                    col_letter = get_column_letter(divider_col_idx)
-                    ws_full.column_dimensions[col_letter].width = 2 
-                    for row in ws_full.iter_rows(min_col=divider_col_idx, max_col=divider_col_idx):
-                        for cell in row:
-                            cell.fill = fill_blue
 
             # --- Summary Sheet Styling ---
             ws_sum = workbook["Summary"]
             ws_sum.sheet_view.showGridLines = False
+
             for row in ws_sum.iter_rows(min_row=1, max_row=ws_sum.max_row, min_col=2, max_col=3):
-                label_cell = row[0]
-                value_cell = row[1]
-                if label_cell.value:
-                    label_cell.border = thin_border
-                    value_cell.border = thin_border
-                    
-                    if label_cell.value == "Validation Summary":
-                        label_cell.fill = fill_green
-                        ws_sum.merge_cells(start_row=label_cell.row, start_column=2, end_row=label_cell.row, end_column=3)
-                        label_cell.alignment = center_align
-                        label_cell.font = font_bold_white
-                    elif label_cell.value == "Total Validation Issues":
-                        label_cell.fill = fill_total_grey
-                        value_cell.fill = fill_total_grey
-                        label_cell.font = font_bold_black
-                        value_cell.font = font_bold_black
+                label_cell, value_cell = row
+
+                if not label_cell.value:
+                    continue
+
+                label_cell.border = thin_border
+                value_cell.border = thin_border
+
+                # Section headers
+                if label_cell.value in [
+                    "Comparison Statistics",
+                    "Missing Records Summary",
+                    "Data Discrepancies Summary"
+                ]:
+                    ws_sum.merge_cells(
+                        start_row=label_cell.row,
+                        start_column=2,
+                        end_row=label_cell.row,
+                        end_column=3
+                    )
+                    label_cell.fill = fill_green
+                    label_cell.font = font_bold_white
+                    label_cell.alignment = center_align
+                    ws_sum.row_dimensions[label_cell.row].height = 22
+
+                # Totals
+                elif label_cell.value in [
+                    "Total Data Discrepancies",
+                    "Total Missing Records",
+                    "Total Validation Issues"
+                ]:
+                    label_cell.fill = fill_total_grey
+                    value_cell.fill = fill_total_grey
+                    label_cell.font = font_bold_black
+                    value_cell.font = font_bold_black
+                    value_cell.alignment = center_align
+
+                # Normal rows
+                else:
+                    label_cell.fill = fill_green
+                    label_cell.font = font_white
+                    try:
+                        float(value_cell.value)
                         value_cell.alignment = center_align
-                    else:
-                        label_cell.fill = fill_green
-                        label_cell.font = font_white
-                        if isinstance(value_cell.value, (int, float)):
-                            value_cell.alignment = center_align
+                    except:
+                        value_cell.alignment = left_align
 
             # --- Discrepancy Highlight ---
             ws_disc = workbook[sheet_discrepancies]
             if "Status" not in validation_df.columns:
-                s_idx, t_idx = None, None
-                for col_idx in range(1, ws_disc.max_column + 1):
-                    val = ws_disc.cell(1, col_idx).value
-                    if val == "PeopleSoft Value": s_idx = col_idx
-                    elif val == "Oracle Cloud Value": t_idx = col_idx
-                if s_idx and t_idx:
+                ps_idx = oc_idx = None
+                for c in range(1, ws_disc.max_column + 1):
+                    header = ws_disc.cell(1, c).value
+                    if header == "PeopleSoft Value":
+                        ps_idx = c
+                    elif header == "Oracle Cloud Value":
+                        oc_idx = c
+
+                if ps_idx and oc_idx:
                     for r in range(2, ws_disc.max_row + 1):
-                        ws_disc.cell(r, s_idx).fill = fill_discrepancy_highlight
-                        ws_disc.cell(r, t_idx).fill = fill_discrepancy_highlight
+                        ws_disc.cell(r, ps_idx).fill = fill_discrepancy_highlight
+                        ws_disc.cell(r, oc_idx).fill = fill_discrepancy_highlight
 
         # Cleanup
         def _clean(path):
