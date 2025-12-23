@@ -8068,7 +8068,7 @@ async def post_validation_excel(
                     oracle_col_name = mappings_dict[l_col]
                     col_name_str = f"{l_col} - {oracle_col_name}"
                     error_entry = context_data.copy()
-                    error_entry["Column Name"] = col_name_str
+                    error_entry["Field Name"] = col_name_str
                     error_entry["PeopleSoft Value"] = l_val
                     error_entry["Oracle Cloud Value"] = o_val
                     validation_rows.append(error_entry)
@@ -8158,9 +8158,9 @@ async def post_validation_excel(
         # --- Comparison Statistics ---
         summary_rows.append(["", "Comparison Statistics", ""])
         summary_rows.append(["", "PeopleSoft File Name", legacyFile.filename])
-        summary_rows.append(["", "PeopleSoft Records Count", len(legacy_df)])
+        summary_rows.append(["", "PeopleSoft Records Count", len(oracle_df)])
         summary_rows.append(["", "Oracle Cloud File Name", oracleFile.filename])
-        summary_rows.append(["", "Oracle Cloud Records Count", len(oracle_df)])
+        summary_rows.append(["", "Oracle Cloud Records Count", len(legacy_df)])
         summary_rows.append(["", "Validation DateTime", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
         summary_rows.append(["", "", ""])
 
