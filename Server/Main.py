@@ -8144,8 +8144,8 @@ async def post_validation_excel(
         final_combined_df = final_combined_df.copy()
 
         # 4. Add Visual Divider Column "||"
-        final_combined_df["||"] = ""
-        final_col_order = ps_cols_in_merged + ["||"] + oc_cols_in_merged
+        final_combined_df[" "] = ""
+        final_col_order = ps_cols_in_merged + [" "] + oc_cols_in_merged
         final_combined_df = final_combined_df[final_col_order]
 
         # --- [10. Clean up exclusive DFs] ---
@@ -8368,7 +8368,7 @@ async def post_validation_excel(
 
         background_tasks.add_task(_clean, temp_dir)
         timestamp = datetime.now().strftime("%m%d%Y %H%M%S")
-        report_filename = f"Mythics_Validation_Results.xlsx"
+        report_filename = f"Mythics Validation Results.xlsx"
 
         return FileResponse(
             output_path,
