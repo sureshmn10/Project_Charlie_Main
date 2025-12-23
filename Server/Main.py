@@ -8209,6 +8209,10 @@ async def post_validation_excel(
             final_combined_df.to_excel(writer, index=False, sheet_name=sheet_full_data)
 
             workbook = writer.book
+            # --- Freeze Header Row (All Sheets Except Summary) ---
+            for sheet in workbook.worksheets:
+                if sheet.title != "Summary":
+                    sheet.freeze_panes = "A2"
 
             # --- Fonts ---
             font_main = Font(name="Calibri", size=9)
@@ -8339,6 +8343,9 @@ async def post_validation_excel(
 
             # --- Discrepancy Highlight ---
             ws_disc = workbook[sheet_discrepancies]
+            # --- Enable Filter for Data Discrepancies Sheet ---
+            ws_disc.auto_filter.ref = ws_disc.dimensions
+
             if "Status" not in validation_df.columns:
                 ps_idx = oc_idx = None
                 for c in range(1, ws_disc.max_column + 1):
