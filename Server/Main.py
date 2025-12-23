@@ -8165,9 +8165,9 @@ async def post_validation_excel(
         # --- Comparison Statistics ---
         summary_rows.append(["", "Comparison Statistics", ""])
         summary_rows.append(["", "PeopleSoft File Name", legacyFile.filename])
-        summary_rows.append(["", "PeopleSoft Records Count", len(legacy_df)])
+        summary_rows.append(["", "PeopleSoft Records Count", len(oracle_df)])
         summary_rows.append(["", "Oracle Cloud File Name", oracleFile.filename])
-        summary_rows.append(["", "Oracle Cloud Records Count", len(oracle_df)])
+        summary_rows.append(["", "Oracle Cloud Records Count", len(legacy_df)])
         summary_rows.append(["", "Validation DateTime", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
         summary_rows.append(["", "", ""])
 
@@ -8346,7 +8346,7 @@ async def post_validation_excel(
             # --- Enable Filter for Data Discrepancies Sheet ---
             if "Status" not in validation_df.columns:
                 ws_disc.auto_filter.ref = ws_disc.dimensions
-                
+
             if "Status" not in validation_df.columns:
                 ps_idx = oc_idx = None
                 for c in range(1, ws_disc.max_column + 1):
@@ -8368,7 +8368,7 @@ async def post_validation_excel(
 
         background_tasks.add_task(_clean, temp_dir)
         timestamp = datetime.now().strftime("%m%d%Y %H%M%S")
-        report_filename = f"Post Upload Validation Report_{timestamp}.xlsx"
+        report_filename = f"Mythics_Validation_Results.xlsx"
 
         return FileResponse(
             output_path,
