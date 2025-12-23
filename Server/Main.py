@@ -8165,16 +8165,16 @@ async def post_validation_excel(
         # --- Comparison Statistics ---
         summary_rows.append(["", "Comparison Statistics", ""])
         summary_rows.append(["", "PeopleSoft File Name", legacyFile.filename])
-        summary_rows.append(["", "PeopleSoft Records Count", len(oracle_df)])
+        summary_rows.append(["", "PeopleSoft Records Count", len(legacy_df)])
         summary_rows.append(["", "Oracle Cloud File Name", oracleFile.filename])
-        summary_rows.append(["", "Oracle Cloud Records Count", len(legacy_df)])
+        summary_rows.append(["", "Oracle Cloud Records Count", len(oracle_df)])
         summary_rows.append(["", "Validation DateTime", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
         summary_rows.append(["", "", ""])
 
         # --- Missing Records Summary ---
         summary_rows.append(["", "Missing Records Summary", ""])
-        summary_rows.append(["", "Records Missing in PeopleSoft", count_missing_ps])
-        summary_rows.append(["", "Records Missing in Oracle Cloud", count_missing_oc])
+        summary_rows.append(["", "Records Missing in PeopleSoft", count_missing_oc])
+        summary_rows.append(["", "Records Missing in Oracle Cloud", count_missing_ps])
         summary_rows.append(["", "Total Missing Records", count_missing_ps + count_missing_oc])
         summary_rows.append(["", "", ""])
 
