@@ -7692,29 +7692,28 @@ async def get_excel_sheets(
             status_code=500,
         )
     
-GOOGLE_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyCIW04m6wCb4u1W2aCjcS7QCq_RTHcHIhE')
+GOOGLE_API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyDeLayqDoueLSYi4p4xRvC22TcjF362-UM')
 genai.configure(api_key=GOOGLE_API_KEY)
 
-def get_smart_mapping_from_gemini(legacy_cols: List[str], oracle_cols: List[str]) -> Dict[str, str]:
+def get_smart_mapping_from_gemini(legacy_cols: List[str], oracle_cols: List[str]):
     """
-    Sends column lists to Gemini to generate semantic mappings.
-    Includes robust JSON parsing (Regex) and fallback logic.
+    Updated to return Mapping + Data Type Detection
     """
+    fallback_result = {
+        "mapping": {},
+        "date_columns": [],
+        "timestamp_columns": []
+    }
     
-    # 1. Helper: Basic Exact Match Fallback
-    # We calculate this first so we have something to return if AI fails or returns empty
-    fallback_mapping = {}
+    # Simple exact match fallback
     oracle_cols_lower = {col.lower(): col for col in oracle_cols}
-    
     for l_col in legacy_cols:
         if l_col.lower() in oracle_cols_lower:
-            fallback_mapping[l_col] = oracle_cols_lower[l_col.lower()]
+            fallback_result["mapping"][l_col] = oracle_cols_lower[l_col.lower()]
 
     if not GOOGLE_API_KEY:
-        print("⚠️ Gemini API Key missing. Using exact match fallback.")
-        return fallback_mapping
+        return fallback_result
 
-    # 2. AI Mapping
     try:
         model = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
@@ -7723,43 +7722,42 @@ def get_smart_mapping_from_gemini(legacy_cols: List[str], oracle_cols: List[str]
 
         prompt = f"""
         You are a Data Integration Expert. 
-        I have two lists of column headers from different Excel sheets. 
-        
         Legacy Columns: {json.dumps(legacy_cols)}
         Oracle Columns: {json.dumps(oracle_cols)}
 
         Task:
-        Map the 'Legacy System Columns' to the most semantically similar 'Oracle System Column'.
-        
-        Rules:
-        - Return a JSON object where keys are Legacy columns and values are Oracle columns.
-        - Only map columns if you are confident they represent the same data (e.g., "fname" -> "First Name", "amt" -> "Amount").
-        - If a Legacy column has no matching Oracle column, do not include it in the JSON keys.
-        - Output PURE JSON only.
+        1. Map 'Legacy Columns' to semantically similar 'Oracle Columns'.
+        2. Identify which 'Legacy Columns' likely contain DATES (e.g., DOB, Start Date).
+        3. Identify which 'Legacy Columns' likely contain TIMESTAMPS (e.g., Created At, Last Update).
+
+        Return JSON format:
+        {{
+            "mapping": {{ "LegacyCol": "OracleCol", ... }},
+            "date_columns": [ "LegacyCol1", ... ],
+            "timestamp_columns": [ "LegacyCol2", ... ]
+        }}
         """
 
         response = model.generate_content(prompt)
-        
-        # --- Robust Parsing Logic ---
-        # Find the JSON object using Regex to ignore any markdown wrapper text
         text = response.text
         match = re.search(r'\{.*\}', text, re.DOTALL)
         
         if match:
-            json_str = match.group(0)
-            ai_mapping = json.loads(json_str)
+            ai_data = json.loads(match.group(0))
+            # Merge Fallback mapping with AI mapping (AI wins conflicts)
+            final_mapping = {**fallback_result["mapping"], **ai_data.get("mapping", {})}
             
-            # Merge: AI mapping takes precedence, but we keep exact matches if AI missed them
-            final_mapping = {**fallback_mapping, **ai_mapping}
-            return final_mapping
+            return {
+                "mapping": final_mapping,
+                "date_columns": ai_data.get("date_columns", []),
+                "timestamp_columns": ai_data.get("timestamp_columns", [])
+            }
         else:
-            print("⚠️ Valid JSON not found in AI response. Using fallback.")
-            return fallback_mapping
+            return fallback_result
 
     except Exception as e:
-        print(f"❌ Gemini AI Mapping Error: {e}")
-        return fallback_mapping
-
+        print(f"❌ Gemini Error: {e}")
+        return fallback_result
 
 @app.post("/api/excel/columns/mapping")
 async def get_excel_columns_mapping(
@@ -7795,13 +7793,15 @@ async def get_excel_columns_mapping(
             return JSONResponse(content={"error": f"Failed to read Oracle file: {str(e)}"}, status_code=400)
 
         # 3. Get AI Mapping
-        mapping = get_smart_mapping_from_gemini(legacy_columns, oracle_columns)
+        ai_result = get_smart_mapping_from_gemini(legacy_columns, oracle_columns)
 
         return {
             "legacy_columns": legacy_columns,
             "oracle_columns": oracle_columns,
-            "suggested_mapping": mapping,
-            "message": "Columns extracted and mapped successfully."
+            "suggested_mapping": ai_result["mapping"], 
+            "date_columns": ai_result["date_columns"],       # <--- Now sending to Frontend
+            "timestamp_columns": ai_result["timestamp_columns"], # <--- Now sending to Frontend
+            "message": "Columns analyzed successfully."
         }
 
     except Exception as e:
@@ -7822,6 +7822,8 @@ async def post_validation_excel(
     keyColumns: str = Form(...),
     includedColumns: str = Form(default="[]"),
     userID: str = Form(default="System"),
+    dateColumns: str = Form(default="[]"),
+    timestampColumns: str = Form(default="[]"),
     # Compatibility args
     legacySheet: str = Form(default=""),
     oracleSheet: str = Form(default=""),
@@ -7829,8 +7831,9 @@ async def post_validation_excel(
     """
     Post-validation endpoint.
     Updated Logic:
-    - Summary sheet reordered: Breakdown first, then Total Discrepancies, then Grand Total.
-    - Removed horizontal divider row in the combined data sheet.
+    1. Normalizes Date/Timestamp columns to 'YYYY/MM/DD' format.
+    2. Fixes 'DataFrame is highly fragmented' warning by copying frame before adding divider.
+    3. Summary sheet reordered: Breakdown -> Total Discrepancies -> Grand Total.
     """
 
     temp_dir = tempfile.mkdtemp()
@@ -7839,7 +7842,7 @@ async def post_validation_excel(
     INTERNAL_KEY = "_derived_key"
 
     try:
-        # --- [Parse JSON Inputs] ---
+        # --- [1. Parse JSON Inputs] ---
         try:
             mappings_dict: Dict[str, str] = json.loads(mappings)
             if not mappings_dict: raise ValueError("Mappings is empty")
@@ -7857,7 +7860,17 @@ async def post_validation_excel(
         except Exception as ex:
             raise HTTPException(status_code=400, detail=f"Invalid keyColumns JSON: {ex}")
 
-        # --- [Read DataFrames] ---
+        # Parse Date/Timestamp Columns
+        try:
+            date_cols_list = json.loads(dateColumns)
+            timestamp_cols_list = json.loads(timestampColumns)
+            # Combine for explicit lookup
+            target_date_cols = set(date_cols_list + timestamp_cols_list)
+        except Exception as ex:
+            print(f"Warning parsing date columns: {ex}")
+            target_date_cols = set()
+
+        # --- [2. Read DataFrames] ---
         try:
             legacy_content = await legacyFile.read()
             legacy_df = pd.read_excel(io.BytesIO(legacy_content))
@@ -7872,7 +7885,31 @@ async def post_validation_excel(
         except Exception as e:
              raise HTTPException(status_code=400, detail=f"Error reading Oracle Cloud file: {str(e)}")
 
-        # --- [Validation Checks] ---
+        # --- [3. Date Normalization Logic] ---
+        def normalize_dates(df, explicit_cols):
+            for col in df.columns:
+                # Check 1: Is this column explicitly defined by user as a date/timestamp?
+                is_explicit = col in explicit_cols
+                
+                # Check 2: Did Pandas automatically detect it as a datetime object?
+                is_detected = pd.api.types.is_datetime64_any_dtype(df[col])
+
+                if is_explicit or is_detected:
+                    try:
+                        # Coerce to datetime (handles mixed formats)
+                        # errors='coerce' turns non-dates into NaT
+                        # dt.strftime('%Y/%m/%d') formats it to YYYY/MM/DD
+                        df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y/%m/%d')
+                        # Replace NaT/NaN (failed conversions or empty cells) with empty string
+                        df[col] = df[col].fillna("") 
+                    except Exception as e:
+                        print(f"Skipping date conversion for column {col}: {e}")
+            return df
+
+        legacy_df = normalize_dates(legacy_df, target_date_cols)
+        oracle_df = normalize_dates(oracle_df, target_date_cols)
+
+        # --- [4. Validation Checks] ---
         missing = []
         for l, o in mappings_dict.items():
             if l not in legacy_df.columns: missing.append(f"PeopleSoft column '{l}' not found")
@@ -7885,7 +7922,7 @@ async def post_validation_excel(
         if missing:
             raise HTTPException(status_code=400, detail={"errors": missing})
 
-        # --- [Derive Internal Key] ---
+        # --- [5. Derive Internal Key] ---
         def generate_key(df, columns):
             return df[columns].astype(str).fillna("").agg('|'.join, axis=1)
 
@@ -7893,7 +7930,7 @@ async def post_validation_excel(
         oracle_key_cols = [mappings_dict.get(k, k) for k in key_cols_list]
         oracle_df[INTERNAL_KEY] = generate_key(oracle_df, oracle_key_cols)
 
-        # --- [Sorting & Exclusive Rows] ---
+        # --- [6. Sorting & Exclusive Rows] ---
         legacy_df = legacy_df.sort_values(by=INTERNAL_KEY).reset_index(drop=True)
         oracle_df = oracle_df.sort_values(by=INTERNAL_KEY).reset_index(drop=True)
 
@@ -7901,7 +7938,7 @@ async def post_validation_excel(
         legacy_only_df = legacy_df[~legacy_df[INTERNAL_KEY].isin(oracle_df[INTERNAL_KEY])].copy()
         oracle_only_df = oracle_df[~oracle_df[INTERNAL_KEY].isin(legacy_df[INTERNAL_KEY])].copy()
 
-        # --- [Merge for Validation Discrepancies] ---
+        # --- [7. Merge for Validation Discrepancies] ---
         legacy_map_keys = list(mappings_dict.keys())
         oracle_map_values = list(mappings_dict.values())
         
@@ -7951,7 +7988,7 @@ async def post_validation_excel(
         else:
             validation_df = pd.DataFrame([{"Status": "All mapped columns matched perfectly"}])
 
-        # --- [NEW: PeopleSoft - Oracle Cloud Data Sheet Generation] ---
+        # --- [8. PeopleSoft - Oracle Cloud Data Sheet Generation] ---
         
         # 1. Consistent Data (Inner Join of ALL columns)
         full_merged_consistent = pd.merge(
@@ -7994,7 +8031,7 @@ async def post_validation_excel(
         
         inconsistent_combined = pd.concat([inconsistent_part1, inconsistent_part2], ignore_index=True)
 
-        # 3. Construct Final DataFrame (REMOVED DIVIDER ROW)
+        # 3. Construct Final DataFrame
         full_cols = ps_cols_in_merged + oc_cols_in_merged
         
         if not inconsistent_combined.empty:
@@ -8002,16 +8039,20 @@ async def post_validation_excel(
         else:
             final_combined_df = full_merged_consistent[full_cols]
 
+        # --- [9. Fragmentation Fix & Divider] ---
+        # Explicit copy to de-fragment memory before adding the divider column
+        final_combined_df = final_combined_df.copy()
+
         # 4. Add Visual Divider Column "||"
         final_combined_df["||"] = ""
         final_col_order = ps_cols_in_merged + ["||"] + oc_cols_in_merged
         final_combined_df = final_combined_df[final_col_order]
 
-        # --- [Clean up exclusive DFs] ---
+        # --- [10. Clean up exclusive DFs] ---
         if INTERNAL_KEY in legacy_only_df.columns: legacy_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
         if INTERNAL_KEY in oracle_only_df.columns: oracle_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
 
-        # --- [Generate Summary Data - REORDERED] ---
+        # --- [11. Generate Summary Data] ---
         summary_rows = []
         total_discrepancies = 0
         if "Status" not in validation_df.columns:
@@ -8045,13 +8086,13 @@ async def post_validation_excel(
         # 3. Total Discrepancies (Moved to bottom)
         summary_rows.append(["", "Total Data Discrepancies", total_discrepancies])
 
-        # 4. Grand Total (Summing up all numbers)
+        # 4. Grand Total
         grand_total = count_missing_ps + count_missing_oc + total_discrepancies
         summary_rows.append(["", "Total Validation Issues", grand_total])
 
         summary_df = pd.DataFrame(summary_rows)
 
-        # --- [Excel Generation & Styling] ---
+        # --- [12. Excel Generation & Styling] ---
         sheet_missing_ps = "Missing in PeopleSoft"
         sheet_missing_oc = "Missing in Oracle Cloud"
         sheet_discrepancies = "Data Discrepancies"
@@ -8070,7 +8111,7 @@ async def post_validation_excel(
             font_main = Font(name='Calibri', size=9)
             font_white = Font(name='Calibri', size=9, color="FFFFFF")
             font_bold_white = Font(name='Calibri', size=9, color="FFFFFF", bold=True)
-            font_bold_black = Font(name='Calibri', size=9, bold=True) # New style for totals
+            font_bold_black = Font(name='Calibri', size=9, bold=True)
             
             fill_green = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
             fill_ps_header = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
@@ -8080,13 +8121,13 @@ async def post_validation_excel(
             fill_grey_header = PatternFill(start_color="808080", end_color="808080", fill_type="solid") 
             fill_blue_header = PatternFill(start_color="0070C0", end_color="0070C0", fill_type="solid") 
             fill_blue = PatternFill(start_color="6495ED", end_color="6495ED", fill_type="solid") 
-            fill_total_grey = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid") # New fill for total
+            fill_total_grey = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
 
             thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             center_align = Alignment(horizontal="center", vertical="center")
             left_align = Alignment(horizontal="left", vertical="center", wrap_text=False)
 
-            # --- 1. Global Formatting ---
+            # --- Global Formatting ---
             for sheet in workbook.worksheets:
                 for col_idx, column_cells in enumerate(sheet.columns, 1):
                     max_length = 0
@@ -8105,7 +8146,7 @@ async def post_validation_excel(
                     if adjusted_width < 10: adjusted_width = 10
                     sheet.column_dimensions[col_letter].width = adjusted_width
 
-            # --- 2. Header Styling ---
+            # --- Header Styling ---
             def style_header(sheet_name, fill_color):
                 if sheet_name in workbook.sheetnames:
                     ws = workbook[sheet_name]
@@ -8117,7 +8158,7 @@ async def post_validation_excel(
             style_header(sheet_missing_oc, fill_oc_header)
             style_header(sheet_discrepancies, fill_disc_header)
 
-            # --- 3. Combined Data Sheet Styling ---
+            # --- Combined Data Sheet Styling ---
             if sheet_full_data in workbook.sheetnames:
                 ws_full = workbook[sheet_full_data]
                 divider_col_idx = None
@@ -8140,7 +8181,7 @@ async def post_validation_excel(
                         for cell in row:
                             cell.fill = fill_blue
 
-            # --- 4. Summary Sheet Styling (Updated for Totals) ---
+            # --- Summary Sheet Styling ---
             ws_sum = workbook["Summary"]
             ws_sum.sheet_view.showGridLines = False
             for row in ws_sum.iter_rows(min_row=1, max_row=ws_sum.max_row, min_col=2, max_col=3):
@@ -8156,7 +8197,6 @@ async def post_validation_excel(
                         label_cell.alignment = center_align
                         label_cell.font = font_bold_white
                     elif label_cell.value == "Total Validation Issues":
-                        # Highlight the grand total
                         label_cell.fill = fill_total_grey
                         value_cell.fill = fill_total_grey
                         label_cell.font = font_bold_black
@@ -8168,7 +8208,7 @@ async def post_validation_excel(
                         if isinstance(value_cell.value, (int, float)):
                             value_cell.alignment = center_align
 
-            # --- 5. Discrepancy Highlight ---
+            # --- Discrepancy Highlight ---
             ws_disc = workbook[sheet_discrepancies]
             if "Status" not in validation_df.columns:
                 s_idx, t_idx = None, None
@@ -8201,7 +8241,7 @@ async def post_validation_excel(
     except Exception as e:
         print(f"Processing Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-        
+
 @app.post("/get-sheets")
 async def get_sheets(file: UploadFile = File(...)):
     """
