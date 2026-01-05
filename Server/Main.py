@@ -7990,13 +7990,13 @@ async def post_validation_excel(
     timestampColumns: str = Form(default="[]"),
     dateColumnstarget: str = Form(default="[]"),
     timestampColumnstarget: str = Form(default="[]"),
-    legacySheet: str = Form(default=""),
-    oracleSheet: str = Form(default=""),
+    legacySheet: str = Form(default=None), # Changed default to None for logic check
+    oracleSheet: str = Form(default=None), # Changed default to None for logic check
 ):
     """
     OPTIMIZED Post-validation endpoint with FAST STYLING.
-    Uses vectorization for date parsing and comparison.
-    Optimized styling: limits auto-size to 50 rows and removes cell-by-cell font application.
+    Fixes: Now correctly reads specific Sheets if provided.
+    Fixes: Handles Pandas FutureWarning for downcasting.
     """
     logger.info("Starting optimized validation process with fast styling...")
     start_time = time.time()
@@ -8018,9 +8018,23 @@ async def post_validation_excel(
         if not key_cols_list: raise ValueError("Key columns list is empty")
 
         # --- [2. Read DataFrames] ---
-        logger.info("Reading Excel files...")
-        legacy_df = pd.read_excel(io.BytesIO(await legacyFile.read()), dtype=object)
-        oracle_df = pd.read_excel(io.BytesIO(await oracleFile.read()), dtype=object)
+        logger.info(f"Reading Excel files... Legacy Sheet: {legacySheet}, Oracle Sheet: {oracleSheet}")
+        
+        # FIX: Handle empty strings or None for sheet names
+        legacy_sheet_param = legacySheet if legacySheet and legacySheet.strip() else 0
+        oracle_sheet_param = oracleSheet if oracleSheet and oracleSheet.strip() else 0
+
+        legacy_df = pd.read_excel(
+            io.BytesIO(await legacyFile.read()), 
+            sheet_name=legacy_sheet_param,
+            dtype=object
+        )
+        
+        oracle_df = pd.read_excel(
+            io.BytesIO(await oracleFile.read()), 
+            sheet_name=oracle_sheet_param,
+            dtype=object
+        )
 
         legacy_df.columns = legacy_df.columns.astype(str).str.strip()
         oracle_df.columns = oracle_df.columns.astype(str).str.strip()
@@ -8028,8 +8042,8 @@ async def post_validation_excel(
         # Validate columns existence
         missing = []
         for l, o in mappings_dict.items():
-            if l not in legacy_df.columns: missing.append(f"PeopleSoft column '{l}' not found")
-            if o not in oracle_df.columns: missing.append(f"Oracle Cloud column '{o}' not found")
+            if l not in legacy_df.columns: missing.append(f"PeopleSoft column '{l}' not found in sheet '{legacy_sheet_param}'")
+            if o not in oracle_df.columns: missing.append(f"Oracle Cloud column '{o}' not found in sheet '{oracle_sheet_param}'")
         
         if missing:
             raise HTTPException(status_code=400, detail={"errors": missing})
@@ -8069,8 +8083,10 @@ async def post_validation_excel(
         l_suffix_cols = [c + '_L' for c in cols_to_compare]
         o_suffix_cols = [c + '_O' for c in cols_to_compare]
         
-        df_l = merged[l_suffix_cols].fillna("").astype(str)
-        df_o = merged[o_suffix_cols].fillna("").astype(str)
+        # FIX: Opt-in to future behavior to silence downcasting warning
+        with pd.option_context('future.no_silent_downcasting', True):
+            df_l = merged[l_suffix_cols].fillna("").astype(str)
+            df_o = merged[o_suffix_cols].fillna("").astype(str)
         
         df_l.columns = cols_to_compare
         df_o.columns = cols_to_compare
@@ -8097,7 +8113,9 @@ async def post_validation_excel(
             })
             
             context_cols = list(set(key_cols_list + included_cols_list))
-            context_df = legacy_df[[INTERNAL_KEY] + [c for c in context_cols if c in legacy_df.columns]].drop_duplicates(subset=INTERNAL_KEY)
+            # Ensure we don't try to access columns that were dropped or don't exist
+            valid_context_cols = [c for c in context_cols if c in legacy_df.columns]
+            context_df = legacy_df[[INTERNAL_KEY] + valid_context_cols].drop_duplicates(subset=INTERNAL_KEY)
             
             validation_df = pd.merge(validation_df, context_df, on=INTERNAL_KEY, how='left')
             validation_df["Column Name"] = validation_df["Column Name"].apply(lambda x: f"{x} - {mappings_dict.get(x, x)}")
@@ -8201,16 +8219,13 @@ async def post_validation_excel(
                         cell.alignment = align_center
                     
                     # Optimized Auto-size (limit to top 50 rows only)
-                    # This prevents reading all 60k rows for width calculation
                     for col in ws.iter_cols(max_row=50):
                         max_length = 0
                         col_letter = get_column_letter(col[0].column)
                         
-                        # Check header
                         if col[0].value:
                             max_length = len(str(col[0].value))
                         
-                        # Check sample data (skip header row 0)
                         for cell in col[1:]:
                             if cell.value:
                                 max_length = max(max_length, len(str(cell.value)))
@@ -8258,11 +8273,9 @@ async def post_validation_excel(
                     max_length = 0
                     col_letter = get_column_letter(col[0].column)
                     
-                    # Check header
                     if col[0].value:
                         max_length = len(str(col[0].value))
 
-                    # Check sample data
                     for cell in col[1:]:
                         if cell.value:
                             max_length = max(max_length, len(str(cell.value)))
@@ -8279,10 +8292,11 @@ async def post_validation_excel(
                 # Set width
                 ws.column_dimensions[divider_col_letter].width = 4
                 
-                # Apply to column cells (Iterate full column carefully or skip)
-                # Note: Iterating 60k cells here is fast if we don't read value, just set style
-                # But to be safe, we will just set it for the Used Range
-                for cell in ws[divider_col_letter]:
+                # Apply to column cells
+                # FIX: We ensure we only iterate rows that actually have data to avoid processing empty rows forever
+                max_row_in_ws = ws.max_row
+                for row_idx in range(1, max_row_in_ws + 1):
+                    cell = ws.cell(row=row_idx, column=divider_col_idx)
                     cell.fill = fill_divider_col
                     cell.border = border_divider
                     cell.value = "" # Clear text for visual clarity
@@ -8346,8 +8360,7 @@ async def post_validation_excel(
         raise
     except Exception as e:
         logger.error(f"Processing Error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e)) 
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/get-sheets")
