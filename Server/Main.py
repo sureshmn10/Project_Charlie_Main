@@ -8127,6 +8127,19 @@ async def post_validation_excel(
             validation_df = validation_df[final_report_cols]
         else:
             validation_df = pd.DataFrame([{"Status": "All mapped columns matched perfectly"}])
+        
+        # --- [6.1] Discrepancy Count Per Column (for Summary) ---
+        column_discrepancy_counts = []
+        logger.info("Calculating discrepancy counts per column...")
+        if "Status" not in validation_df.columns and not validation_df.empty:
+            col_counts = (
+                validation_df["Column Name"]
+                .value_counts()
+                .sort_values(ascending=False)
+            )
+
+            for col_name, count in col_counts.items():
+                column_discrepancy_counts.append(["", col_name, int(count)])
 
         # --- [7. Missing Records] ---
         common_keys = merged.index
@@ -8140,13 +8153,10 @@ async def post_validation_excel(
         if INTERNAL_KEY in oracle_only_df.columns: oracle_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
 
         # --- [8. Full Data Report] ---
-        merged[" "] = "||"
-        merged_sorted_cols = l_suffix_cols + [" "] + o_suffix_cols
+        merged_sorted_cols = l_suffix_cols + o_suffix_cols
         full_merged_consistent = merged[merged_sorted_cols].copy()
-        
-        # REMOVED SUFFIXES: Renaming columns to be plain, relying on the divider for context
-        full_merged_consistent.columns = cols_to_compare + [" "] + cols_to_compare
-        
+        full_merged_consistent.columns = cols_to_compare + cols_to_compare
+
         # --- [9. Generate Summary] ---
         total_discrepancies = len(validation_df) if "Status" not in validation_df.columns else 0
         count_missing_ps = len(legacy_only_df)
@@ -8167,6 +8177,7 @@ async def post_validation_excel(
             ["", "Total Missing Records", count_missing_ps + count_missing_oc],
             ["", "", ""],
             ["", "Data Discrepancies Summary", ""],
+            *column_discrepancy_counts,
             ["", "Total Data Discrepancies", total_discrepancies],
             ["", "", ""],
             ["", "Total Validation Issues", grand_total]
@@ -8242,57 +8253,63 @@ async def post_validation_excel(
             # --- Custom Header Styling for Side-by-Side Data (Contrast Colors) ---
             if sheet_full_data in workbook.sheetnames:
                 ws = workbook[sheet_full_data]
-                ws.freeze_panes = "A2"
-                
-                # Colors for Contrast
-                fill_source = fill_header_ps # Dark Blue for Source
-                fill_target = fill_header_oc # Teal for Target
-                fill_div = PatternFill("solid", fgColor="BFBFBF")
-                
-                # Identify the divider column index (len of source columns + 1)
-                divider_col_idx = len(cols_to_compare) + 1
-                divider_col_letter = get_column_letter(divider_col_idx)
-                
-                # Style Header Row with Contrast
-                for col_idx, cell in enumerate(ws[1], start=1):
-                    cell.alignment = align_center
-                    
-                    if col_idx < divider_col_idx:
-                        cell.fill = fill_source
-                    elif col_idx == divider_col_idx:
-                        cell.fill = fill_div
-                    else:
-                        cell.fill = fill_target
-                    
-                    # Force white bold font for all headers
-                    cell.font = font_white
 
-                # Optimized Auto-size for Full Data (limit to top 50 rows)
-                for col in ws.iter_cols(max_row=50):
-                    if col[0].column == divider_col_idx: continue
-                    
+                # Insert a new row at the top
+                ws.insert_rows(1)
+
+                ps_col_count = len(cols_to_compare)
+                oc_col_count = len(cols_to_compare)
+
+                ps_start = 1
+                ps_end = ps_col_count
+                oc_start = ps_end + 1
+                oc_end = ps_end + oc_col_count
+
+                # Merge header cells
+                ws.merge_cells(start_row=1, start_column=ps_start, end_row=1, end_column=ps_end)
+                ws.merge_cells(start_row=1, start_column=oc_start, end_row=1, end_column=oc_end)
+
+                # Set header values
+                ws.cell(row=1, column=ps_start).value = "PeopleSoft"
+                ws.cell(row=1, column=oc_start).value = "Oracle Cloud"
+
+                # Styling
+                fill_ps = fill_header_ps
+                fill_oc = fill_header_oc
+
+                for col in range(ps_start, ps_end + 1):
+                    cell = ws.cell(row=1, column=col)
+                    cell.fill = fill_ps
+                    cell.font = font_white
+                    cell.alignment = align_center
+
+                for col in range(oc_start, oc_end + 1):
+                    cell = ws.cell(row=1, column=col)
+                    cell.fill = fill_oc
+                    cell.font = font_white
+                    cell.alignment = align_center
+
+                # Style actual column headers (now row 2)
+                ws.freeze_panes = "A3"
+
+                for cell in ws[2]:
+                    cell.font = font_white
+                    cell.alignment = align_center
+                    if cell.column <= ps_end:
+                        cell.fill = fill_ps
+                    else:
+                        cell.fill = fill_oc
+
+                # Auto-size (limit rows for speed)
+                for col in ws.iter_cols(min_row=2, max_row=50):
                     max_length = 0
                     col_letter = get_column_letter(col[0].column)
-                    
-                    if col[0].value:
-                        max_length = len(str(col[0].value))
 
-                    for cell in col[1:]:
+                    for cell in col:
                         if cell.value:
                             max_length = max(max_length, len(str(cell.value)))
-                    
-                    adjusted_width = min(max((max_length + 2) * 1.2, 10), 60)
-                    ws.column_dimensions[col_letter].width = adjusted_width
-            
-                # --- STYLE DIVIDER (OPTIMIZED) ---
-                # Divider Style: Set width narrow
-                ws.column_dimensions[divider_col_letter].width = 4
-                
-                # SPEED OPTIMIZATION:
-                # Removed the loop that iterated over every single row to style the divider cell.
-                # This was a major bottleneck (O(n) styling operations).
-                # We now rely on the "||" text value (set in Pandas) to act as the visual divider.
-                # The Header cell is already styled by the loop above.
+
+                    ws.column_dimensions[col_letter].width = min(max((max_length + 2) * 1.2, 10), 60)
 
             # --- Special Styling for Summary Sheet ---
             ws_sum = workbook["Summary"]
@@ -8354,6 +8371,9 @@ async def post_validation_excel(
     except Exception as e:
         logger.error(f"Processing Error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
 
 @app.post("/get-sheets")
 async def get_sheets(file: UploadFile = File(...)):
