@@ -7997,6 +7997,7 @@ async def post_validation_excel(
     OPTIMIZED Post-validation endpoint with FAST STYLING.
     Fixes: Now correctly reads specific Sheets if provided.
     Fixes: Handles Pandas FutureWarning for downcasting.
+    Speedup: Removed expensive row-by-row styling for divider column.
     """
     logger.info("Starting optimized validation process with fast styling...")
     start_time = time.time()
@@ -8178,7 +8179,7 @@ async def post_validation_excel(
         sheet_missing_ps = "Missing in PeopleSoft"
         sheet_missing_oc = "Missing in Oracle Cloud"
         sheet_discrepancies = "Data Discrepancies"
-        sheet_full_data = "Side-by-Side Data"
+        sheet_full_data = "PeopleSoft - Oracle Cloud Data"
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             # Write Data
@@ -8283,23 +8284,15 @@ async def post_validation_excel(
                     adjusted_width = min(max((max_length + 2) * 1.2, 10), 60)
                     ws.column_dimensions[col_letter].width = adjusted_width
             
-                # --- STYLE DIVIDER ---
-                # Divider Style: Grey fill with medium borders
-                fill_divider_col = PatternFill("solid", fgColor="BFBFBF") # Medium Grey
-                side_divider = Side(style='medium', color="000000")
-                border_divider = Border(left=side_divider, right=side_divider)
-                
-                # Set width
+                # --- STYLE DIVIDER (OPTIMIZED) ---
+                # Divider Style: Set width narrow
                 ws.column_dimensions[divider_col_letter].width = 4
                 
-                # Apply to column cells
-                # FIX: We ensure we only iterate rows that actually have data to avoid processing empty rows forever
-                max_row_in_ws = ws.max_row
-                for row_idx in range(1, max_row_in_ws + 1):
-                    cell = ws.cell(row=row_idx, column=divider_col_idx)
-                    cell.fill = fill_divider_col
-                    cell.border = border_divider
-                    cell.value = "" # Clear text for visual clarity
+                # SPEED OPTIMIZATION:
+                # Removed the loop that iterated over every single row to style the divider cell.
+                # This was a major bottleneck (O(n) styling operations).
+                # We now rely on the "||" text value (set in Pandas) to act as the visual divider.
+                # The Header cell is already styled by the loop above.
 
             # --- Special Styling for Summary Sheet ---
             ws_sum = workbook["Summary"]
@@ -8361,7 +8354,6 @@ async def post_validation_excel(
     except Exception as e:
         logger.error(f"Processing Error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/get-sheets")
 async def get_sheets(file: UploadFile = File(...)):
