@@ -3,6 +3,7 @@ uvicorn
 pandas
 openpyxl
 python-calamine
+xlsxwriter
 pydantic
 python-multipart 
 requests

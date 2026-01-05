@@ -38,7 +38,7 @@ import google.generativeai as genai
 from openpyxl.styles import PatternFill, Border, Side, Font, Alignment
 from openpyxl.utils import get_column_letter
 import xml.etree.ElementTree as ET
-import python_calamine
+from openpyxl.worksheet.table import Table, TableStyleInfo 
 
 
 load_dotenv()
@@ -7858,11 +7858,123 @@ def normalize_dates(df, explicit_cols):
 
     return df
 
-# Try to import calamine for faster reading, fallback to standard if not installed
-try:
-    EXCEL_ENGINE = "calamine"
-except ImportError:
-    EXCEL_ENGINE = "openpyxl" # Fallback (Standard)
+
+
+
+def fast_normalize_dates(df: pd.DataFrame, explicit_cols: Set[str]) -> pd.DataFrame:
+    """
+    Vectorized date normalization.
+    Instead of iterating row-by-row, we uses pandas built-ins.
+    """
+    # 1. Identify date columns (Explicit + Auto-detected)
+    target_cols = [col for col in df.columns if col in explicit_cols or pd.api.types.is_datetime64_any_dtype(df[col])]
+
+    for col in target_cols:
+        # Convert to datetime using coerce (invalid formats become NaT)
+        # This is C-optimized and extremely fast compared to dateutil.parser
+        df[col] = pd.to_datetime(df[col], errors='coerce')
+        
+        # Format valid dates to YYYY/MM/DD strings
+        # NaT values become "NaT" or NaN, we fill them with empty string
+        df[col] = df[col].dt.strftime("%Y/%m/%d").fillna("")
+        
+    return df
+
+def fast_generate_key(df: pd.DataFrame, columns: List[str]) -> pd.Series:
+    """
+    Vectorized key generation. 
+    Replaces slow .agg('|'.join, axis=1) with vectorized string addition.
+    """
+    if not columns:
+        return pd.Series([""] * len(df), index=df.index)
+    
+    # Start with the first column converted to string
+    res = df[columns[0]].astype(str).fillna("")
+    
+    # Add subsequent columns with separator
+    for col in columns[1:]:
+        res = res + "|" + df[col].astype(str).fillna("")
+        
+    return res
+
+@app.post("/api/excel/columns/mapping")
+async def get_excel_columns_mapping(
+    legacyFile: UploadFile = File(...),
+    oracleFile: UploadFile = File(...),
+    legacySheet: str = Form(default=""),
+    oracleSheet: str = Form(default=""),
+    customerName: str = Form(...),
+    instanceName: str = Form(...)
+):
+    try:
+        legacy_content = await legacyFile.read()
+        try:
+            legacy_df = pd.read_excel(io.BytesIO(legacy_content))
+            legacy_columns = legacy_df.columns.astype(str).str.strip().tolist()
+        except Exception as e:
+            return JSONResponse(content={"error": f"Failed to read Legacy file: {str(e)}"}, status_code=400)
+
+        oracle_content = await oracleFile.read()
+        try:
+            oracle_df = pd.read_excel(io.BytesIO(oracle_content))
+            oracle_columns = oracle_df.columns.astype(str).str.strip().tolist()
+        except Exception as e:
+            return JSONResponse(content={"error": f"Failed to read Oracle file: {str(e)}"}, status_code=400)
+
+        ai_result = get_smart_mapping_from_gemini(legacy_columns, oracle_columns)
+
+        return {
+            "legacy_columns": legacy_columns,
+            "oracle_columns": oracle_columns,
+            "suggested_mapping": ai_result["mapping"], 
+            "date_columns": ai_result["date_columns"],
+            "timestamp_columns": ai_result["timestamp_columns"],
+            "message": "Columns analyzed successfully."
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            content={"error": f"Processing Error: {str(e)}"},
+            status_code=500,
+        )
+
+# --- OPTIMIZED VALIDATION LOGIC STARTS HERE ---
+
+def fast_normalize_dates(df: pd.DataFrame, explicit_cols: Set[str]) -> pd.DataFrame:
+    """
+    Vectorized date normalization.
+    Instead of iterating row-by-row, we uses pandas built-ins.
+    """
+    # 1. Identify date columns (Explicit + Auto-detected)
+    target_cols = [col for col in df.columns if col in explicit_cols or pd.api.types.is_datetime64_any_dtype(df[col])]
+
+    for col in target_cols:
+        # Convert to datetime using coerce (invalid formats become NaT)
+        # This is C-optimized and extremely fast compared to dateutil.parser
+        df[col] = pd.to_datetime(df[col], errors='coerce')
+        
+        # Format valid dates to YYYY/MM/DD strings
+        # NaT values become "NaT" or NaN, we fill them with empty string
+        df[col] = df[col].dt.strftime("%Y/%m/%d").fillna("")
+        
+    return df
+
+def fast_generate_key(df: pd.DataFrame, columns: List[str]) -> pd.Series:
+    """
+    Vectorized key generation. 
+    Replaces slow .agg('|'.join, axis=1) with vectorized string addition.
+    """
+    if not columns:
+        return pd.Series([""] * len(df), index=df.index)
+    
+    # Start with the first column converted to string
+    res = df[columns[0]].astype(str).fillna("")
+    
+    # Add subsequent columns with separator
+    for col in columns[1:]:
+        res = res + "|" + df[col].astype(str).fillna("")
+        
+    return res
 
 @app.post("/api/excel/post_validation/validate")
 async def post_validation_excel(
@@ -7874,326 +7986,150 @@ async def post_validation_excel(
     mappings: str = Form(...),
     keyColumns: str = Form(...),
     includedColumns: str = Form(default="[]"),
-    userID: str = Form(default="System"),
     dateColumns: str = Form(default="[]"),
     timestampColumns: str = Form(default="[]"),
     dateColumnstarget: str = Form(default="[]"),
     timestampColumnstarget: str = Form(default="[]"),
-    # Compatibility args
     legacySheet: str = Form(default=""),
     oracleSheet: str = Form(default=""),
 ):
     """
-    Highly Optimized Post-validation endpoint.
-    Uses Vectorization instead of Iteration for massive speed gains.
+    OPTIMIZED Post-validation endpoint with FAST STYLING.
+    Uses vectorization for date parsing and comparison.
+    Optimized styling: limits auto-size to 50 rows and removes cell-by-cell font application.
     """
+    logger.info("Starting optimized validation process with fast styling...")
+    start_time = time.time()
 
     temp_dir = tempfile.mkdtemp()
     output_path = os.path.join(temp_dir, "PostValidation_Report.xlsx")
-
     INTERNAL_KEY = "_derived_key"
 
     try:
-        # --- [1. Parse JSON Inputs] ---
-        try:
-            mappings_dict: Dict[str, str] = json.loads(mappings)
-            if not mappings_dict: raise ValueError("Mappings is empty")
-            
-            # Create reverse mapping for easier lookup later
-            reverse_mappings = {v: k for k, v in mappings_dict.items()}
-            
-            included_cols_list: List[str] = json.loads(includedColumns)
-            key_cols_list: List[str] = json.loads(keyColumns)
-            if not key_cols_list: raise ValueError("Key columns list is empty")
+        # --- [1. Parse Inputs] ---
+        mappings_dict: Dict[str, str] = json.loads(mappings)
+        included_cols_list: List[str] = json.loads(includedColumns)
+        key_cols_list: List[str] = json.loads(keyColumns)
+        
+        legacy_date_cols = set(json.loads(dateColumns) + json.loads(timestampColumns))
+        target_date_cols = set(json.loads(dateColumnstarget) + json.loads(timestampColumnstarget))
 
-            # Parse Date Columns
-            date_cols_list = json.loads(dateColumns)
-            timestamp_cols_list = json.loads(timestampColumns)
-            legacy_date_cols = set(date_cols_list + timestamp_cols_list)
-            
-            target_date_list = json.loads(dateColumnstarget)
-            target_timestamp_list = json.loads(timestampColumnstarget)
-            target_date_cols = set(target_date_list + target_timestamp_list)
-        except Exception as ex:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON inputs: {ex}")
+        if not mappings_dict: raise ValueError("Mappings is empty")
+        if not key_cols_list: raise ValueError("Key columns list is empty")
 
-        # --- [2. Read DataFrames (Optimized)] ---
-        # Note: Using 'calamine' engine if available is significantly faster
-        try:
-            legacy_content = await legacyFile.read()
-            legacy_df = pd.read_excel(io.BytesIO(legacy_content), engine=EXCEL_ENGINE)
-            legacy_df.columns = legacy_df.columns.astype(str).str.strip()
-        except Exception as e:
-             raise HTTPException(status_code=400, detail=f"Error reading PeopleSoft file: {str(e)}")
+        # --- [2. Read DataFrames] ---
+        logger.info("Reading Excel files...")
+        legacy_df = pd.read_excel(io.BytesIO(await legacyFile.read()), dtype=object)
+        oracle_df = pd.read_excel(io.BytesIO(await oracleFile.read()), dtype=object)
 
-        try:
-            oracle_content = await oracleFile.read()
-            oracle_df = pd.read_excel(io.BytesIO(oracle_content), engine=EXCEL_ENGINE)
-            oracle_df.columns = oracle_df.columns.astype(str).str.strip()
-        except Exception as e:
-             raise HTTPException(status_code=400, detail=f"Error reading Oracle Cloud file: {str(e)}")
+        legacy_df.columns = legacy_df.columns.astype(str).str.strip()
+        oracle_df.columns = oracle_df.columns.astype(str).str.strip()
 
-        # --- [3. Vectorized Date Normalization] ---
-        def fast_normalize_dates(df, cols_to_fix):
-            """
-            Vectorized date normalization. 
-            Handles string dates and Excel serial floats without loops.
-            """
-            if not cols_to_fix:
-                return df
-                
-            # Filter cols that actually exist in DF
-            valid_cols = [c for c in cols_to_fix if c in df.columns]
-            
-            for col in valid_cols:
-                # 1. Coerce to numeric (handles Excel serials like 45234)
-                numeric_series = pd.to_numeric(df[col], errors='coerce')
-                
-                # 2. Convert Excel serials to datetime
-                # Excel origin is usually 1899-12-30
-                date_from_serial = pd.to_datetime(numeric_series, unit='D', origin='1899-12-30', errors='coerce')
-                
-                # 3. Convert standard strings to datetime
-                date_from_string = pd.to_datetime(df[col], errors='coerce', dayfirst=True)
-                
-                # 4. Combine: prefer serial conversion, fallback to string conversion
-                combined_dates = date_from_serial.combine_first(date_from_string)
-                
-                # 5. Format to string YYYY/MM/DD, keeping NaTs as NaNs for now
-                formatted_dates = combined_dates.dt.strftime('%Y/%m/%d')
-                
-                # 6. Fill NaNs with original values (cleaned string) for things that refused to parse
-                # This ensures we don't lose data that looked like a date but wasn't
-                original_cleaned = df[col].astype(str).str.strip().replace({'nan': '', 'NaT': '', 'None': ''})
-                df[col] = formatted_dates.fillna(original_cleaned)
-                
-            return df
-
-        legacy_df = fast_normalize_dates(legacy_df, legacy_date_cols)
-        oracle_df = fast_normalize_dates(oracle_df, target_date_cols)
-
-        # --- [4. Validation Checks] ---
+        # Validate columns existence
         missing = []
         for l, o in mappings_dict.items():
             if l not in legacy_df.columns: missing.append(f"PeopleSoft column '{l}' not found")
             if o not in oracle_df.columns: missing.append(f"Oracle Cloud column '{o}' not found")
-        for k_col in key_cols_list:
-            if k_col not in legacy_df.columns: missing.append(f"Key column '{k_col}' missing in PeopleSoft")
-            o_key_col = mappings_dict.get(k_col, k_col)
-            if o_key_col not in oracle_df.columns: missing.append(f"Key column '{o_key_col}' missing in Oracle Cloud")
-
+        
         if missing:
             raise HTTPException(status_code=400, detail={"errors": missing})
 
-        # --- [5. Vectorized Key Generation] ---
-        # Much faster than apply()
-        legacy_df[INTERNAL_KEY] = legacy_df[key_cols_list].astype(str).fillna("").agg('|'.join, axis=1)
+        # --- [3. Vectorized Date Normalization] ---
+        logger.info("Normalizing dates...")
+        legacy_df = fast_normalize_dates(legacy_df, legacy_date_cols)
+        oracle_df = fast_normalize_dates(oracle_df, target_date_cols)
+
+        # --- [4. Vectorized Key Generation] ---
+        logger.info("Generating keys...")
+        legacy_df[INTERNAL_KEY] = fast_generate_key(legacy_df, key_cols_list)
         
         oracle_key_cols = [mappings_dict.get(k, k) for k in key_cols_list]
-        oracle_df[INTERNAL_KEY] = oracle_df[oracle_key_cols].astype(str).fillna("").agg('|'.join, axis=1)
+        oracle_df[INTERNAL_KEY] = fast_generate_key(oracle_df, oracle_key_cols)
 
-        # Drop duplicates on key to prevent merge explosion (optional, based on requirement)
-        # legacy_df = legacy_df.drop_duplicates(subset=[INTERNAL_KEY])
-        # oracle_df = oracle_df.drop_duplicates(subset=[INTERNAL_KEY])
+        # --- [5. Comparison Logic] ---
+        logger.info("Comparing data...")
+        
+        # Rename Oracle columns to match Legacy names for alignment
+        oracle_to_legacy_map = {v: k for k, v in mappings_dict.items()}
+        cols_to_rename = {col: oracle_to_legacy_map[col] for col in oracle_df.columns if col in oracle_to_legacy_map}
+        oracle_renamed = oracle_df.rename(columns=cols_to_rename)
 
-        # --- [6. Vectorized Sorting & Exclusive Rows] ---
-        # Use isin() for boolean masking - highly optimized in C
+        cols_to_compare = list(mappings_dict.keys())
+        cols_to_compare = [c for c in cols_to_compare if c in legacy_df.columns and c in oracle_renamed.columns]
+
+        merged = pd.merge(
+            legacy_df.set_index(INTERNAL_KEY)[cols_to_compare],
+            oracle_renamed.set_index(INTERNAL_KEY)[cols_to_compare],
+            left_index=True,
+            right_index=True,
+            suffixes=('_L', '_O'),
+            how='inner'
+        )
+
+        l_suffix_cols = [c + '_L' for c in cols_to_compare]
+        o_suffix_cols = [c + '_O' for c in cols_to_compare]
+        
+        df_l = merged[l_suffix_cols].fillna("").astype(str)
+        df_o = merged[o_suffix_cols].fillna("").astype(str)
+        
+        df_l.columns = cols_to_compare
+        df_o.columns = cols_to_compare
+
+        # Boolean mask of differences
+        diff_mask = df_l.apply(lambda x: x.str.strip()) != df_o.apply(lambda x: x.str.strip())
+
+        # --- [6. Extract Discrepancies] ---
+        if diff_mask.any().any():
+            diff_l_stacked = df_l.where(diff_mask).stack()
+            diff_o_stacked = df_o.where(diff_mask).stack()
+            
+            diff_keys = diff_l_stacked.index.get_level_values(0)
+            diff_cols = diff_l_stacked.index.get_level_values(1)
+            
+            legacy_vals = diff_l_stacked.values
+            oracle_vals = diff_o_stacked.values
+            
+            validation_df = pd.DataFrame({
+                INTERNAL_KEY: diff_keys,
+                "Column Name": diff_cols,
+                "PeopleSoft Value": legacy_vals,
+                "Oracle Cloud Value": oracle_vals
+            })
+            
+            context_cols = list(set(key_cols_list + included_cols_list))
+            context_df = legacy_df[[INTERNAL_KEY] + [c for c in context_cols if c in legacy_df.columns]].drop_duplicates(subset=INTERNAL_KEY)
+            
+            validation_df = pd.merge(validation_df, context_df, on=INTERNAL_KEY, how='left')
+            validation_df["Column Name"] = validation_df["Column Name"].apply(lambda x: f"{x} - {mappings_dict.get(x, x)}")
+            
+            final_report_cols = key_cols_list + [c for c in included_cols_list if c not in key_cols_list] + ["Column Name", "PeopleSoft Value", "Oracle Cloud Value"]
+            final_report_cols = [c for c in final_report_cols if c in validation_df.columns]
+            
+            validation_df = validation_df[final_report_cols]
+        else:
+            validation_df = pd.DataFrame([{"Status": "All mapped columns matched perfectly"}])
+
+        # --- [7. Missing Records] ---
+        common_keys = merged.index
         legacy_keys = legacy_df[INTERNAL_KEY]
         oracle_keys = oracle_df[INTERNAL_KEY]
         
-        legacy_mask = legacy_keys.isin(oracle_keys)
-        oracle_mask = oracle_keys.isin(legacy_keys)
-
-        legacy_only_df = legacy_df[~legacy_mask].copy()
-        oracle_only_df = oracle_df[~oracle_mask].copy()
+        legacy_only_df = legacy_df[~legacy_df[INTERNAL_KEY].isin(common_keys)].copy()
+        oracle_only_df = oracle_df[~oracle_df[INTERNAL_KEY].isin(common_keys)].copy()
         
-        # Consistent Data (Inner Join)
-        # We only need the columns relevant for validation + the key
-        
-        # Prepare subset for validation to save memory
-        l_map_keys = list(mappings_dict.keys())
-        o_map_values = list(mappings_dict.values())
-        
-        val_legacy_sel = legacy_df[legacy_mask].set_index(INTERNAL_KEY)
-        val_oracle_sel = oracle_df[oracle_mask].set_index(INTERNAL_KEY)
-
-        # --- [7. Vectorized Value Normalization & Comparison] ---
-        # This replaces the huge iterrows loop
-        
-        validation_rows = []
-        
-        # We need to compare based on the mapping. 
-        # Let's rename Oracle columns to match Legacy columns temporarily for direct dataframe comparison
-        val_oracle_renamed = val_oracle_sel.rename(columns=reverse_mappings)
-        
-        # Select only the columns we care about comparing
-        cols_to_compare = [c for c in l_map_keys if c not in key_cols_list]
-        
-        if cols_to_compare:
-            # Extract aligned dataframes
-            # align() ensures rows match by index (INTERNAL_KEY)
-            df_l_comp, df_o_comp = val_legacy_sel[cols_to_compare].align(val_oracle_renamed[cols_to_compare], join='inner', axis=0)
-
-            # --- Vectorized Value Cleaning ---
-            def clean_values_vectorized(df):
-                # 1. Convert to string
-                d = df.astype(str)
-                # 2. Strip whitespace and lower case
-                d = d.apply(lambda x: x.str.strip().str.lower())
-                # 3. Replace 'nan', 'none' with empty string
-                d = d.replace(['nan', 'none', 'nat'], '', regex=False)
-                # 4. Handle "1.0" vs "1"
-                # If a value ends in .0, strip it. 
-                # Regex: Replace \.0$ with empty string, but only if it's the end of string
-                d = d.replace(r'\.0$', '', regex=True)
-                return d
-
-            df_l_clean = clean_values_vectorized(df_l_comp)
-            df_o_clean = clean_values_vectorized(df_o_comp)
-
-            # --- The Comparison ---
-            # Returns a boolean dataframe (True where values differ)
-            diff_mask = df_l_clean != df_o_clean
-
-            # If there are differences
-            if diff_mask.any().any():
-                # Stack to get (Index, Column) pairs where True
-                diff_stacked = diff_mask.stack()
-                # Filter only True (discrepancies)
-                diff_locations = diff_stacked[diff_stacked]
-                
-                # Create the Report DataFrame
-                # Index is (INTERNAL_KEY, Column Name)
-                discrepancy_df = pd.DataFrame(index=diff_locations.index)
-                
-                # Reset index to make Key and Column accessible
-                discrepancy_df = discrepancy_df.reset_index()
-                discrepancy_df.columns = [INTERNAL_KEY, 'Column Name Legacy']
-                
-                # Map Legacy Col Name to "Legacy - Oracle" format
-                # We need to apply this to the column column
-                discrepancy_df['Oracle Column'] = discrepancy_df['Column Name Legacy'].map(mappings_dict)
-                discrepancy_df['Column Name'] = discrepancy_df['Column Name Legacy'] + " - " + discrepancy_df['Oracle Column']
-                
-                # Fetch original values using lookup (much faster than row iteration)
-                # We join back to the original dataframes to get the "Raw" values (presumed case sensitive preference)
-                
-                # Get Legacy Values
-                # Merge discrepancy list with Legacy Data on Key
-                discrepancy_df = discrepancy_df.merge(
-                    val_legacy_sel.reset_index()[[INTERNAL_KEY] + key_cols_list + included_cols_list + cols_to_compare],
-                    on=INTERNAL_KEY,
-                    how='left'
-                )
-                
-                # Get Oracle Values
-                # We need to fetch the value from the Oracle DF corresponding to the mapped column
-                # This is tricky in vectorization because the column name changes per row.
-                # However, we can use `lookup` or melt. Melt is safer.
-                
-                # Let's melt the Oracle Clean/Raw data
-                oracle_melted = val_oracle_renamed[cols_to_compare].reset_index().melt(id_vars=INTERNAL_KEY, var_name='Column Name Legacy', value_name='Oracle Cloud Value')
-                
-                # Merge the Oracle values into the result
-                final_validation = discrepancy_df.merge(
-                    oracle_melted,
-                    on=[INTERNAL_KEY, 'Column Name Legacy'],
-                    how='left'
-                )
-
-                # Lookup the specific "PeopleSoft Value" based on the "Column Name Legacy"
-                # Since we merged *all* columns in step "Get Legacy Values", we now need to pick the dynamic one.
-                # Faster approach: Melt legacy too.
-                legacy_melted = val_legacy_sel[cols_to_compare].reset_index().melt(id_vars=INTERNAL_KEY, var_name='Column Name Legacy', value_name='PeopleSoft Value')
-                
-                # Optimize: Drop the specific columns from final_validation before merging legacy values to avoid dupes, 
-                # but keep Key/Included cols
-                meta_cols = [INTERNAL_KEY, 'Column Name', 'Oracle Cloud Value'] + key_cols_list + [c for c in included_cols_list if c not in key_cols_list]
-                final_validation = final_validation[meta_cols].merge(
-                    legacy_melted,
-                    on=[INTERNAL_KEY, 'Column Name Legacy'],
-                    how='left'
-                )
-
-                validation_df = final_validation
-                
-                # Reorder columns
-                ordered_cols = key_cols_list + [c for c in included_cols_list if c not in key_cols_list] + ["Column Name", "PeopleSoft Value", "Oracle Cloud Value"]
-                # Ensure cols exist
-                existing_cols = [c for c in ordered_cols if c in validation_df.columns]
-                validation_df = validation_df[existing_cols]
-                
-            else:
-                 validation_df = pd.DataFrame([{"Status": "All mapped columns matched perfectly"}])
-        else:
-             validation_df = pd.DataFrame([{"Status": "No columns mapped for comparison"}])
-
-
-        # --- [8. Merged Data Sheet Generation] ---
-        # 1. Inner Join (Consistent)
-        full_merged_consistent = pd.merge(
-            legacy_df, 
-            oracle_df, 
-            on=INTERNAL_KEY, 
-            how="inner", 
-            suffixes=('', '_OracleCloud')
-        )
-        
-        # 2. Outer/Exclusive parts
-        # We process these efficiently without row iteration
-        ps_cols = [c for c in legacy_df.columns if c != INTERNAL_KEY]
-        
-        # Calculate Oracle columns for the merged view
-        oc_cols_in_merged = []
-        rename_map_oracle = {}
-        for c in oracle_df.columns:
-            if c == INTERNAL_KEY: continue
-            if c in ps_cols:
-                new_name = f"{c}_OracleCloud"
-                oc_cols_in_merged.append(new_name)
-                rename_map_oracle[c] = new_name
-            else:
-                oc_cols_in_merged.append(c)
-
-        # Prepare Inconsistent Rows
-        # Legacy Only (Needs empty Oracle cols)
-        legacy_only_part = legacy_only_df.copy()
-        for c in oc_cols_in_merged:
-            legacy_only_part[c] = "" # Vectorized assignment
-            
-        # Oracle Only (Needs empty Legacy cols & Rename)
-        oracle_only_part = oracle_only_df.copy().rename(columns=rename_map_oracle)
-        for c in ps_cols:
-            if c not in oracle_only_part.columns:
-                oracle_only_part[c] = ""
-                
-        # Concat
-        final_cols_order = ps_cols + oc_cols_in_merged
-        
-        # Ensure ordering
-        legacy_only_part = legacy_only_part.reindex(columns=final_cols_order, fill_value="")
-        oracle_only_part = oracle_only_part.reindex(columns=final_cols_order, fill_value="")
-        
-        inconsistent_combined = pd.concat([legacy_only_part, oracle_only_part], ignore_index=True)
-        
-        # Add Divider
-        # Efficiently insert column without iterating
-        full_merged_consistent[" || "] = ""
-        inconsistent_combined[" || "] = ""
-        
-        final_display_order = ps_cols + [" || "] + oc_cols_in_merged
-        
-        full_merged_consistent = full_merged_consistent.reindex(columns=final_display_order, fill_value="")
-        inconsistent_combined = inconsistent_combined.reindex(columns=final_display_order, fill_value="")
-
-        final_combined_df = pd.concat([full_merged_consistent, inconsistent_combined], ignore_index=True)
-
-        # Cleanup internal keys from display
         if INTERNAL_KEY in legacy_only_df.columns: legacy_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
         if INTERNAL_KEY in oracle_only_df.columns: oracle_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
 
-        # --- [9. Summary Generation] ---
-        total_discrepancies = 0 if "Status" in validation_df.columns else len(validation_df)
+        # --- [8. Full Data Report] ---
+        merged[" "] = "||"
+        merged_sorted_cols = l_suffix_cols + [" "] + o_suffix_cols
+        full_merged_consistent = merged[merged_sorted_cols].copy()
+        
+        # REMOVED SUFFIXES: Renaming columns to be plain, relying on the divider for context
+        full_merged_consistent.columns = cols_to_compare + [" "] + cols_to_compare
+        
+        # --- [9. Generate Summary] ---
+        total_discrepancies = len(validation_df) if "Status" not in validation_df.columns else 0
         count_missing_ps = len(legacy_only_df)
         count_missing_oc = len(oracle_only_df)
         grand_total = count_missing_ps + count_missing_oc + total_discrepancies
@@ -8212,162 +8148,193 @@ async def post_validation_excel(
             ["", "Total Missing Records", count_missing_ps + count_missing_oc],
             ["", "", ""],
             ["", "Data Discrepancies Summary", ""],
-        ]
-
-        if total_discrepancies > 0 and "Column Name" in validation_df.columns:
-            breakdown = validation_df["Column Name"].value_counts()
-            for col_name, count in breakdown.items():
-                summary_data.append(["", col_name, count])
-
-        summary_data.extend([
             ["", "Total Data Discrepancies", total_discrepancies],
             ["", "", ""],
             ["", "Total Validation Issues", grand_total]
-        ])
-        
+        ]
         summary_df = pd.DataFrame(summary_data)
 
-        # --- [10. Optimized Excel Writing] ---
-        # Using openpyxl but optimizing the styling loops
+        # --- [10. Write to Excel with Perfect Styling] ---
+        logger.info("Writing and Styling Excel...")
         
         sheet_missing_ps = "Missing in PeopleSoft"
         sheet_missing_oc = "Missing in Oracle Cloud"
         sheet_discrepancies = "Data Discrepancies"
-        sheet_full_data = "PeopleSoft - Oracle Cloud Data"
+        sheet_full_data = "Side-by-Side Data"
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            # Write Data
             summary_df.to_excel(writer, index=False, header=False, sheet_name="Summary")
             oracle_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_ps)
             legacy_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_oc)
             validation_df.to_excel(writer, index=False, sheet_name=sheet_discrepancies)
-            final_combined_df.to_excel(writer, index=False, sheet_name=sheet_full_data)
+            full_merged_consistent.to_excel(writer, index=False, sheet_name=sheet_full_data)
 
             workbook = writer.book
-
-            # Styles
+            
+            # --- Styles Definitions ---
+            font_white = Font(name="Calibri", size=9, color="FFFFFF", bold=True)
+            font_black = Font(name="Calibri", size=9, color="000000", bold=True)
+            font_bold_black = Font(name="Calibri", size=9, bold=True)
             font_main = Font(name="Calibri", size=9)
-            font_white_bold = Font(name="Calibri", size=9, color="FFFFFF", bold=True)
-            font_bold = Font(name="Calibri", size=9, bold=True)
             
             fill_green = PatternFill("solid", fgColor="00B050")
+            fill_header_ps = PatternFill("solid", fgColor="1F497D") # Dark Blue
+            fill_header_oc = PatternFill("solid", fgColor="31869B") # Teal
+            fill_header_err = PatternFill("solid", fgColor="C0504D") # Red
+            fill_header_std = PatternFill("solid", fgColor="0070C0") # Blue
             fill_grey = PatternFill("solid", fgColor="D9D9D9")
-            fill_ps = PatternFill("solid", fgColor="1F497D")
-            fill_oc = PatternFill("solid", fgColor="31869B")
-            fill_disc = PatternFill("solid", fgColor="C0504D")
-            fill_blue = PatternFill("solid", fgColor="0070C0")
-            fill_blue_light = PatternFill("solid", fgColor="6495ED")
-            fill_grey_header = PatternFill("solid", fgColor="808080")
-            fill_highlight = PatternFill("solid", fgColor="FFFFCC")
-
+            
+            border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             align_center = Alignment(horizontal="center", vertical="center")
             align_left = Alignment(horizontal="left", vertical="center")
-            thin_border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
 
-            def fast_format_header(ws, fill_color):
-                # Only iterate the first row (header)
-                for cell in ws[1]:
-                    cell.fill = fill_color
-                    cell.font = font_white_bold
-                    cell.alignment = align_center
-
-            def fast_autosize(ws):
-                # Auto-size approximation
-                # Iterating every cell in 60k rows is slow. 
-                # We check the header + first 100 rows to estimate width.
-                for i, col in enumerate(ws.columns, 1):
-                    max_len = 0
-                    col_letter = get_column_letter(i)
-                    
-                    # Check header
-                    header_val = col[0].value
-                    if header_val: max_len = len(str(header_val))
-                    
-                    # Check first 100 rows only for speed
-                    for j, cell in enumerate(col[1:101]): 
-                        if cell.value:
-                            max_len = max(max_len, len(str(cell.value)))
-                    
-                    ws.column_dimensions[col_letter].width = min(max((max_len + 2) * 1.1, 10), 60)
-
-            # Apply Styles
-            for sheet_name in [sheet_missing_ps, sheet_missing_oc, sheet_discrepancies, sheet_full_data]:
+            # --- Helper: Style Header Row ---
+            def style_sheet_header(sheet_name, fill_color):
                 if sheet_name in workbook.sheetnames:
                     ws = workbook[sheet_name]
                     ws.freeze_panes = "A2"
                     
-                    # Header Color
-                    if sheet_name == sheet_missing_ps: fast_format_header(ws, fill_ps)
-                    elif sheet_name == sheet_missing_oc: fast_format_header(ws, fill_oc)
-                    elif sheet_name == sheet_discrepancies: fast_format_header(ws, fill_disc)
-                    elif sheet_name == sheet_full_data:
-                        # Complex header for full data
-                        for cell in ws[1]:
-                            if cell.value == " || ":
-                                cell.fill = fill_blue_light
-                            elif cell.value in ps_cols:
-                                cell.fill = fill_grey_header
-                            else:
-                                cell.fill = fill_blue
-                            cell.font = font_white_bold
-                            cell.alignment = align_center
+                    for cell in ws[1]:
+                        cell.fill = fill_color
+                        cell.font = font_white
+                        cell.alignment = align_center
                     
-                    # Resize
-                    fast_autosize(ws)
+                    # Optimized Auto-size (limit to top 50 rows only)
+                    # This prevents reading all 60k rows for width calculation
+                    for col in ws.iter_cols(max_row=50):
+                        max_length = 0
+                        col_letter = get_column_letter(col[0].column)
+                        
+                        # Check header
+                        if col[0].value:
+                            max_length = len(str(col[0].value))
+                        
+                        # Check sample data (skip header row 0)
+                        for cell in col[1:]:
+                            if cell.value:
+                                max_length = max(max_length, len(str(cell.value)))
+                        
+                        adjusted_width = min(max((max_length + 2) * 1.2, 10), 60)
+                        ws.column_dimensions[col_letter].width = adjusted_width
 
-            # Discrepancy Highlight (Optimized)
-            # Instead of nested loops, use conditional formatting ranges if possible, 
-            # or strictly target the columns needed.
-            if sheet_discrepancies in workbook.sheetnames and "Status" not in validation_df.columns:
-                ws_disc = workbook[sheet_discrepancies]
-                ws_disc.auto_filter.ref = ws_disc.dimensions
+            # Apply Styles to Data Sheets
+            style_sheet_header(sheet_missing_ps, fill_header_ps)
+            style_sheet_header(sheet_missing_oc, fill_header_oc)
+            style_sheet_header(sheet_discrepancies, fill_header_err)
+            
+            # --- Custom Header Styling for Side-by-Side Data (Contrast Colors) ---
+            if sheet_full_data in workbook.sheetnames:
+                ws = workbook[sheet_full_data]
+                ws.freeze_panes = "A2"
                 
-                # Find indices once
-                headers = [c.value for c in ws_disc[1]]
-                try:
-                    ps_idx = headers.index("PeopleSoft Value") + 1
-                    oc_idx = headers.index("Oracle Cloud Value") + 1
+                # Colors for Contrast
+                fill_source = fill_header_ps # Dark Blue for Source
+                fill_target = fill_header_oc # Teal for Target
+                fill_div = PatternFill("solid", fgColor="BFBFBF")
+                
+                # Identify the divider column index (len of source columns + 1)
+                divider_col_idx = len(cols_to_compare) + 1
+                divider_col_letter = get_column_letter(divider_col_idx)
+                
+                # Style Header Row with Contrast
+                for col_idx, cell in enumerate(ws[1], start=1):
+                    cell.alignment = align_center
                     
-                    # Apply fill to the two columns entirely
-                    # Iterating 60k rows for 2 columns is fast enough (120k ops), compared to whole sheet
-                    for row in ws_disc.iter_rows(min_row=2, min_col=ps_idx, max_col=oc_idx):
-                        for cell in row:
-                            cell.fill = fill_highlight
-                except ValueError:
-                    pass
+                    if col_idx < divider_col_idx:
+                        cell.fill = fill_source
+                    elif col_idx == divider_col_idx:
+                        cell.fill = fill_div
+                    else:
+                        cell.fill = fill_target
+                    
+                    # Force white bold font for all headers
+                    cell.font = font_white
 
-            # Summary Sheet (Manual formatting is fine here, small data)
+                # Optimized Auto-size for Full Data (limit to top 50 rows)
+                for col in ws.iter_cols(max_row=50):
+                    if col[0].column == divider_col_idx: continue
+                    
+                    max_length = 0
+                    col_letter = get_column_letter(col[0].column)
+                    
+                    # Check header
+                    if col[0].value:
+                        max_length = len(str(col[0].value))
+
+                    # Check sample data
+                    for cell in col[1:]:
+                        if cell.value:
+                            max_length = max(max_length, len(str(cell.value)))
+                    
+                    adjusted_width = min(max((max_length + 2) * 1.2, 10), 60)
+                    ws.column_dimensions[col_letter].width = adjusted_width
+            
+                # --- STYLE DIVIDER ---
+                # Divider Style: Grey fill with medium borders
+                fill_divider_col = PatternFill("solid", fgColor="BFBFBF") # Medium Grey
+                side_divider = Side(style='medium', color="000000")
+                border_divider = Border(left=side_divider, right=side_divider)
+                
+                # Set width
+                ws.column_dimensions[divider_col_letter].width = 4
+                
+                # Apply to column cells (Iterate full column carefully or skip)
+                # Note: Iterating 60k cells here is fast if we don't read value, just set style
+                # But to be safe, we will just set it for the Used Range
+                for cell in ws[divider_col_letter]:
+                    cell.fill = fill_divider_col
+                    cell.border = border_divider
+                    cell.value = "" # Clear text for visual clarity
+
+            # --- Special Styling for Summary Sheet ---
             ws_sum = workbook["Summary"]
             ws_sum.sheet_view.showGridLines = False
-            for row in ws_sum.iter_rows(min_row=1, max_row=ws_sum.max_row, min_col=2, max_col=3):
-                label, val = row
-                if not label.value: continue
-                label.border = thin_border
-                val.border = thin_border
-                
-                if label.value in ["Comparison Statistics", "Missing Records Summary", "Data Discrepancies Summary"]:
-                    label.fill = fill_green
-                    label.font = font_white_bold
-                    ws_sum.merge_cells(start_row=label.row, start_column=2, end_row=label.row, end_column=3)
-                    label.alignment = align_center
-                elif "Total" in str(label.value):
-                    label.fill = fill_grey
-                    val.fill = fill_grey
-                    label.font = font_bold
-                    val.font = font_bold
-                else:
-                    label.fill = fill_green
-                    label.font = font_white_bold
             
-            ws_sum.column_dimensions['B'].width = 40
-            ws_sum.column_dimensions['C'].width = 20
+            # Set specific column widths for perfect alignment
+            ws_sum.column_dimensions['A'].width = 2
+            ws_sum.column_dimensions['B'].width = 45
+            ws_sum.column_dimensions['C'].width = 25
 
-        # Cleanup
+            for row in ws_sum.iter_rows(min_row=1, max_row=ws_sum.max_row, min_col=2, max_col=3):
+                label_cell, value_cell = row
+                
+                if not label_cell.value: continue
+
+                label_cell.border = border_thin
+                value_cell.border = border_thin
+
+                # Header Sections
+                if label_cell.value in ["Comparison Statistics", "Missing Records Summary", "Data Discrepancies Summary"]:
+                    ws_sum.merge_cells(start_row=label_cell.row, start_column=2, end_row=label_cell.row, end_column=3)
+                    label_cell.fill = fill_green
+                    label_cell.font = font_white
+                    label_cell.alignment = align_center
+                    ws_sum.row_dimensions[label_cell.row].height = 20
+                
+                # Totals/Bottom Rows
+                elif "Total" in str(label_cell.value):
+                    label_cell.fill = fill_grey
+                    value_cell.fill = fill_grey
+                    label_cell.font = font_bold_black
+                    value_cell.font = font_bold_black
+                    value_cell.alignment = align_center
+                
+                # Normal Rows
+                else:
+                    label_cell.fill = fill_green
+                    label_cell.font = font_white
+                    label_cell.alignment = align_left
+                    value_cell.alignment = align_center
+
+        logger.info(f"Process completed in {time.time() - start_time:.2f} seconds.")
+
         def _clean(path):
             try: shutil.rmtree(path, ignore_errors=True)
             except: pass
 
         background_tasks.add_task(_clean, temp_dir)
-        report_filename = f"Mythics Validation Results.xlsx"
+        report_filename = f"Mythics_Validation_Results.xlsx"
 
         return FileResponse(
             output_path,
@@ -8378,8 +8345,9 @@ async def post_validation_excel(
     except HTTPException:
         raise
     except Exception as e:
-        # print(f"Processing Error: {str(e)}") # Debug
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Processing Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) 
+
 
 
 @app.post("/get-sheets")
