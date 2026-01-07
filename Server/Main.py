@@ -8152,10 +8152,73 @@ async def post_validation_excel(
         if INTERNAL_KEY in legacy_only_df.columns: legacy_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
         if INTERNAL_KEY in oracle_only_df.columns: oracle_only_df.drop(columns=[INTERNAL_KEY], inplace=True)
 
-        # --- [8. Full Data Report] ---
-        merged_sorted_cols = l_suffix_cols + o_suffix_cols
-        full_merged_consistent = merged[merged_sorted_cols].copy()
-        full_merged_consistent.columns = cols_to_compare + cols_to_compare
+        # --- [8. Full Data Report - Consolidated & Safe] ---
+        logger.info("Preparing consolidated full data report...")
+
+        # 8.1 MATCHED RECORDS (already have _L and _O)
+        matched_df = merged.copy()
+        matched_df["Record Status"] = "MATCHED"
+
+        matched_df = matched_df[
+            [f"{c}_L" for c in cols_to_compare] +
+            [f"{c}_O" for c in cols_to_compare] +
+            ["Record Status"]
+        ]
+
+        # 8.2 MISSING IN ORACLE (exists only in PeopleSoft)
+        ps_missing_rows = []
+
+        for _, row in legacy_only_df.iterrows():
+            record = {}
+            for col in cols_to_compare:
+                record[f"{col}_L"] = row.get(col, "")
+                record[f"{col}_O"] = ""
+            record["Record Status"] = "MISSING_IN_ORACLE"
+            ps_missing_rows.append(record)
+
+        ps_missing_df = pd.DataFrame(ps_missing_rows)
+
+        # 8.3 MISSING IN PEOPLESOFT (exists only in Oracle)
+        oc_missing_rows = []
+
+        for _, row in oracle_only_df.iterrows():
+            record = {}
+            for col in cols_to_compare:
+                record[f"{col}_L"] = ""
+                record[f"{col}_O"] = row.get(col, "")
+            record["Record Status"] = "MISSING_IN_PEOPLESOFT"
+            oc_missing_rows.append(record)
+
+        oc_missing_df = pd.DataFrame(oc_missing_rows)
+
+        # 8.4 CONSOLIDATE ALL
+        final_full_df = pd.concat(
+            [matched_df, ps_missing_df, oc_missing_df],
+            ignore_index=True
+        )
+
+        # 8.5 ORDER: matched first, missing last
+        final_full_df["__order__"] = final_full_df["Record Status"].map({
+            "MATCHED": 0,
+            "MISSING_IN_ORACLE": 1,
+            "MISSING_IN_PEOPLESOFT": 2
+        })
+
+        final_full_df = (
+            final_full_df
+            .sort_values("__order__")
+            .drop(columns="__order__")
+        )
+
+        # 8.6 CLEAN EXCEL HEADERS
+        final_full_df.columns = (
+            cols_to_compare +
+            cols_to_compare +
+            ["Record Status"]
+        )
+
+        logger.info("Full consolidated data report prepared successfully.")
+
 
         # --- [9. Generate Summary] ---
         total_discrepancies = len(validation_df) if "Status" not in validation_df.columns else 0
@@ -8198,7 +8261,8 @@ async def post_validation_excel(
             oracle_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_ps)
             legacy_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_oc)
             validation_df.to_excel(writer, index=False, sheet_name=sheet_discrepancies)
-            full_merged_consistent.to_excel(writer, index=False, sheet_name=sheet_full_data)
+            final_full_df.to_excel(writer, index=False, sheet_name=sheet_full_data)
+
 
             workbook = writer.book
             
