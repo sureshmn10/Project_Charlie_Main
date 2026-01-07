@@ -8422,7 +8422,7 @@ async def post_validation_excel(
             except: pass
 
         background_tasks.add_task(_clean, temp_dir)
-        report_filename = f"Mythics_Validation_Results.xlsx"
+        report_filename = f"MythicsValidationResults_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
         return FileResponse(
             output_path,
