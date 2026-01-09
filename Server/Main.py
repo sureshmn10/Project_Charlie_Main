@@ -8060,6 +8060,39 @@ async def post_validation_excel(
 
         # --- [5. Comparison Logic] ---
         logger.info("Comparing data...")
+        def detect_numeric_columns(df, threshold=0.8):
+            numeric_cols = set()
+
+            for col in df.columns:
+                series = (
+                    df[col]
+                    .astype(str)
+                    .str.replace('%', '', regex=False)
+                    .str.replace(',', '', regex=False)
+                    .str.strip()
+                )
+
+                numeric_ratio = pd.to_numeric(series, errors='coerce').notna().mean()
+
+                if numeric_ratio >= threshold:
+                    numeric_cols.add(col)
+
+            return numeric_cols
+
+
+        def normalize_numeric_series(series):
+            cleaned = (
+                series
+                .astype(str)
+                .str.replace('%', '', regex=False)
+                .str.replace(',', '', regex=False)
+                .str.strip()
+                .replace('', None)
+            )
+
+            return pd.to_numeric(cleaned, errors='coerce').round(4)
+
+
         
         oracle_to_legacy_map = {v: k for k, v in mappings_dict.items()}
         cols_to_rename = {col: oracle_to_legacy_map[col] for col in oracle_df.columns if col in oracle_to_legacy_map}
@@ -8087,8 +8120,31 @@ async def post_validation_excel(
         df_l.columns = cols_to_compare
         df_o.columns = cols_to_compare
 
+        # --- Dynamic Column Type Detection ---
+        numeric_columns = (
+            detect_numeric_columns(df_l)
+            & detect_numeric_columns(df_o)
+        )
+
+        logger.info(f"Dynamically detected numeric columns: {numeric_columns}")
+
+
         # Boolean mask of differences
-        diff_mask = df_l.apply(lambda x: x.str.strip()) != df_o.apply(lambda x: x.str.strip())
+        diff_mask = pd.DataFrame(False, index=df_l.index, columns=df_l.columns)
+
+        for col in cols_to_compare:
+            if col in numeric_columns:
+                l_num = normalize_numeric_series(df_l[col])
+                o_num = normalize_numeric_series(df_o[col])
+
+                diff_mask[col] = (l_num - o_num).abs() > 0.0001
+            else:
+                diff_mask[col] = (
+                    df_l[col].astype(str).str.strip()
+                    !=
+                    df_o[col].astype(str).str.strip()
+                )
+
 
         # --- [6. Extract Discrepancies] ---
         if diff_mask.any().any():
