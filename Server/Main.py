@@ -7760,6 +7760,8 @@ def get_smart_mapping_from_gemini(legacy_cols: List[str], oracle_cols: List[str]
         print(f"❌ Gemini Error: {e}")
         return fallback_result
 
+
+
 @app.post("/api/excel/columns/mapping")
 async def get_excel_columns_mapping(
     legacyFile: UploadFile = File(...),
@@ -7860,43 +7862,6 @@ def normalize_dates(df, explicit_cols):
 
 
 
-
-def fast_normalize_dates(df: pd.DataFrame, explicit_cols: Set[str]) -> pd.DataFrame:
-    """
-    Vectorized date normalization.
-    Instead of iterating row-by-row, we uses pandas built-ins.
-    """
-    # 1. Identify date columns (Explicit + Auto-detected)
-    target_cols = [col for col in df.columns if col in explicit_cols or pd.api.types.is_datetime64_any_dtype(df[col])]
-
-    for col in target_cols:
-        # Convert to datetime using coerce (invalid formats become NaT)
-        # This is C-optimized and extremely fast compared to dateutil.parser
-        df[col] = pd.to_datetime(df[col], errors='coerce')
-        
-        # Format valid dates to YYYY/MM/DD strings
-        # NaT values become "NaT" or NaN, we fill them with empty string
-        df[col] = df[col].dt.strftime("%Y/%m/%d").fillna("")
-        
-    return df
-
-def fast_generate_key(df: pd.DataFrame, columns: List[str]) -> pd.Series:
-    """
-    Vectorized key generation. 
-    Replaces slow .agg('|'.join, axis=1) with vectorized string addition.
-    """
-    if not columns:
-        return pd.Series([""] * len(df), index=df.index)
-    
-    # Start with the first column converted to string
-    res = df[columns[0]].astype(str).fillna("")
-    
-    # Add subsequent columns with separator
-    for col in columns[1:]:
-        res = res + "|" + df[col].astype(str).fillna("")
-        
-    return res
-
 @app.post("/api/excel/columns/mapping")
 async def get_excel_columns_mapping(
     legacyFile: UploadFile = File(...),
@@ -7976,6 +7941,23 @@ def fast_generate_key(df: pd.DataFrame, columns: List[str]) -> pd.Series:
         
     return res
 
+
+
+MAX_COLUMNS_PER_SHEET = 450
+
+def enforce_sheet_column_limit(df: pd.DataFrame, sheet_name: str):
+    col_count = df.shape[1]
+    if col_count > MAX_COLUMNS_PER_SHEET:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Sheet '{sheet_name}' exceeds column limit. "
+                f"Found {col_count} columns, maximum allowed is {MAX_COLUMNS_PER_SHEET}. "
+                f"Please reduce mappings or included columns."
+            )
+        )
+
+
 @app.post("/api/excel/post_validation/validate")
 async def post_validation_excel(
     background_tasks: BackgroundTasks,
@@ -8037,6 +8019,18 @@ async def post_validation_excel(
         legacy_df.columns = legacy_df.columns.astype(str).str.strip()
         oracle_df.columns = oracle_df.columns.astype(str).str.strip()
 
+        if legacy_df.shape[1] > 450:
+            raise HTTPException(
+                status_code=400,
+                detail=f"PeopleSoft file has {legacy_df.shape[1]} columns. Max allowed is 450."
+            )
+
+        if oracle_df.shape[1] > 450:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Oracle Cloud file has {oracle_df.shape[1]} columns. Max allowed is 450."
+            )
+
         # Validate columns existence
         missing = []
         for l, o in mappings_dict.items():
@@ -8074,7 +8068,10 @@ async def post_validation_excel(
 
                 numeric_ratio = pd.to_numeric(series, errors='coerce').notna().mean()
 
-                if numeric_ratio >= threshold:
+                # Reject columns with frequent hyphenated values
+                hyphen_ratio = series.str.contains('-', regex=False).mean()
+
+                if numeric_ratio >= threshold and hyphen_ratio < 0.2:
                     numeric_cols.add(col)
 
             return numeric_cols
@@ -8137,7 +8134,12 @@ async def post_validation_excel(
                 l_num = normalize_numeric_series(df_l[col])
                 o_num = normalize_numeric_series(df_o[col])
 
-                diff_mask[col] = (l_num - o_num).abs() > 0.0001
+                diff_mask[col] = (
+                            (l_num.notna() & o_num.notna() & ((l_num - o_num).abs() > 0.0001))
+                            |
+                            (l_num.isna() ^ o_num.isna())
+                        )
+
             else:
                 diff_mask[col] = (
                     df_l[col].astype(str).str.strip()
@@ -8279,6 +8281,12 @@ async def post_validation_excel(
         sheet_missing_oc = "Missing in Oracle Cloud"
         sheet_discrepancies = "Data Discrepancies"
         sheet_full_data = "PeopleSoft - Oracle Cloud Data"
+
+        enforce_sheet_column_limit(summary_df, "Summary")
+        enforce_sheet_column_limit(validation_df, "Data Discrepancies")
+        enforce_sheet_column_limit(legacy_only_df, "Missing in Oracle Cloud")
+        enforce_sheet_column_limit(oracle_only_df, "Missing in PeopleSoft")
+        enforce_sheet_column_limit(final_full_df, "PeopleSoft - Oracle Cloud Data")
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             summary_df.to_excel(writer, index=False, header=False, sheet_name="Summary")
@@ -8471,6 +8479,9 @@ async def post_validation_excel(
     except Exception as e:
         logger.error(f"Processing Error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
 
 @app.post("/get-sheets")
 async def get_sheets(file: UploadFile = File(...)):
