@@ -7974,6 +7974,7 @@ async def post_validation_excel(
     timestampColumnstarget: str = Form(default="[]"),
     legacySheet: str = Form(default=None),
     oracleSheet: str = Form(default=None),
+    includeSourceTargetFiles: bool = Form(default=False)
 ):
     """
     OPTIMIZED Post-validation endpoint with FAST STYLING.
@@ -8148,38 +8149,82 @@ async def post_validation_excel(
                 )
 
 
-        # --- [6. Extract Discrepancies] ---
+        # --- [6. Extract Discrepancies - ROBUST & INDEX-SAFE] ---
         if diff_mask.any().any():
-            diff_l_stacked = df_l.where(diff_mask).stack()
-            diff_o_stacked = df_o.where(diff_mask).stack()
-            
-            diff_keys = diff_l_stacked.index.get_level_values(0)
-            diff_cols = diff_l_stacked.index.get_level_values(1)
-            
-            legacy_vals = diff_l_stacked.values
-            oracle_vals = diff_o_stacked.values
-            
-            validation_df = pd.DataFrame({
-                INTERNAL_KEY: diff_keys,
-                "Column Name": diff_cols,
-                "PeopleSoft Value": legacy_vals,
-                "Oracle Cloud Value": oracle_vals
-            })
-            
-            context_cols = list(set(key_cols_list + included_cols_list))
+
+            # 1️⃣ Row-level mismatch summary
+            mismatch_cols_series = diff_mask.apply(
+                lambda r: ", ".join(r.index[r]),
+                axis=1
+            )
+
+            validation_df = (
+                pd.DataFrame({
+                    "Mismatched Columns": mismatch_cols_series
+                })
+                .query("`Mismatched Columns` != ''")
+                .reset_index()                 # 🔥 FIX: index → column
+                .rename(columns={"index": INTERNAL_KEY})
+            )
+
+            # 2️⃣ Context columns
+            context_cols = list(dict.fromkeys(key_cols_list + included_cols_list))
             valid_context_cols = [c for c in context_cols if c in legacy_df.columns]
-            context_df = legacy_df[[INTERNAL_KEY] + valid_context_cols].drop_duplicates(subset=INTERNAL_KEY)
-            
-            validation_df = pd.merge(validation_df, context_df, on=INTERNAL_KEY, how='left')
-            validation_df["Column Name"] = validation_df["Column Name"].apply(lambda x: f"{x} - {mappings_dict.get(x, x)}")
-            
-            final_report_cols = key_cols_list + [c for c in included_cols_list if c not in key_cols_list] + ["Column Name", "PeopleSoft Value", "Oracle Cloud Value"]
+
+            context_df = (
+                legacy_df[[INTERNAL_KEY] + valid_context_cols]
+                .drop_duplicates(subset=INTERNAL_KEY)
+            )
+
+            validation_df = validation_df.merge(
+                context_df,
+                on=INTERNAL_KEY,
+                how="left"
+            )
+
+            # 3️⃣ Build readable value strings
+            def build_value_string(row, df):
+                cols = row["Mismatched Columns"].split(", ")
+                key = row[INTERNAL_KEY]
+                return "; ".join(
+                    f"{c}={df.at[key, c]}"
+                    for c in cols
+                    if c in df.columns
+                )
+
+            validation_df["PeopleSoft Value"] = validation_df.apply(
+                lambda r: build_value_string(r, df_l),
+                axis=1
+            )
+
+            validation_df["Oracle Cloud Value"] = validation_df.apply(
+                lambda r: build_value_string(r, df_o),
+                axis=1
+            )
+
+            # 4️⃣ Friendly column labels
+            validation_df["Column Name"] = validation_df["Mismatched Columns"].apply(
+                lambda cols: "; ".join(
+                    f"{c} - {mappings_dict.get(c, c)}"
+                    for c in cols.split(", ")
+                )
+            )
+
+            # 5️⃣ Final column order
+            final_report_cols = (
+                key_cols_list
+                + [c for c in included_cols_list if c not in key_cols_list]
+                + ["Column Name", "PeopleSoft Value", "Oracle Cloud Value"]
+            )
+
             final_report_cols = [c for c in final_report_cols if c in validation_df.columns]
-            
             validation_df = validation_df[final_report_cols]
+
         else:
-            validation_df = pd.DataFrame([{"Status": "All mapped columns matched perfectly"}])
-        
+            validation_df = pd.DataFrame(
+                [{"Status": "All mapped columns matched perfectly"}]
+            )
+
         # --- [NEW] Add Comment Columns to Discrepancies ---
         comment_cols = ["Mythics Comments", "Oracle Comments", "ParkView Comments"]
         for col in comment_cols:
@@ -8238,10 +8283,24 @@ async def post_validation_excel(
             oc_missing_rows.append(record)
         oc_missing_df = pd.DataFrame(oc_missing_rows)
 
-        final_full_df = pd.concat([matched_df, ps_missing_df, oc_missing_df], ignore_index=True)
-        final_full_df["__order__"] = final_full_df["Record Status"].map({"MATCHED": 0, "MISSING_IN_ORACLE": 1, "MISSING_IN_PEOPLESOFT": 2})
-        final_full_df = final_full_df.sort_values("__order__").drop(columns="__order__")
-        final_full_df.columns = cols_to_compare + cols_to_compare + ["Record Status"]
+        final_full_df = None
+
+        if includeSourceTargetFiles:
+            logger.info("Including Source-Target Full Data tab...")
+            # existing logic that builds final_full_df
+            final_full_df = pd.concat([matched_df, ps_missing_df, oc_missing_df], ignore_index=True)
+            final_full_df["__order__"] = final_full_df["Record Status"].map({"MATCHED": 0, "MISSING_IN_ORACLE": 1, "MISSING_IN_PEOPLESOFT": 2})
+            final_full_df = final_full_df.sort_values("__order__").drop(columns="__order__")
+            final_full_df.columns = cols_to_compare + cols_to_compare + ["Record Status"]
+        else:
+            logger.info("Skipping Source-Target Full Data tab for performance.")
+        
+
+        EXCEL_MAX_ROWS = 900_000   # stay safe
+        def split_dataframe_by_rows(df, max_rows):
+            for start in range(0, len(df), max_rows):
+                yield df.iloc[start:start + max_rows]
+
 
         # --- [9. Generate Summary] ---
         total_discrepancies = len(validation_df) if "Status" not in validation_df.columns else 0
@@ -8286,14 +8345,37 @@ async def post_validation_excel(
         enforce_sheet_column_limit(validation_df, "Data Discrepancies")
         enforce_sheet_column_limit(legacy_only_df, "Missing in Oracle Cloud")
         enforce_sheet_column_limit(oracle_only_df, "Missing in PeopleSoft")
-        enforce_sheet_column_limit(final_full_df, "PeopleSoft - Oracle Cloud Data")
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             summary_df.to_excel(writer, index=False, header=False, sheet_name="Summary")
             oracle_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_ps)
             legacy_only_df.to_excel(writer, index=False, sheet_name=sheet_missing_oc)
             validation_df.to_excel(writer, index=False, sheet_name=sheet_discrepancies)
-            final_full_df.to_excel(writer, index=False, sheet_name=sheet_full_data)
+            if includeSourceTargetFiles and final_full_df is not None:
+                logger.info("Writing Source-Target data...")
+
+                if len(final_full_df) <= EXCEL_MAX_ROWS:
+                    # FAST PATH: single sheet
+                    final_full_df.to_excel(
+                        writer,
+                        index=False,
+                        sheet_name=sheet_full_data
+                    )
+                else:
+                    # SCALE PATH: split sheets
+                    logger.warning("Large dataset detected, splitting Source-Target data into chunks")
+
+                    for idx, chunk in enumerate(
+                        split_dataframe_by_rows(final_full_df, EXCEL_MAX_ROWS),
+                        start=1
+                    ):
+                        chunk_sheet_name = f"{sheet_full_data}_{idx}"
+                        chunk.to_excel(
+                            writer,
+                            index=False,
+                            sheet_name=chunk_sheet_name
+                        )
+
 
             workbook = writer.book
             
@@ -8311,6 +8393,52 @@ async def post_validation_excel(
             
             border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             align_center = Alignment(horizontal="center", vertical="center")
+            
+
+            def style_full_data_header_only(ws, ps_cols_count):
+                """
+                FAST styling for large sheets:
+                - Styles ONLY headers
+                - No row iteration
+                """
+                ws.insert_rows(1)
+
+                ps_end = ps_cols_count
+                oc_start = ps_end + 1
+                oc_end = ps_end * 2
+
+                # Merge titles
+                ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ps_end)
+                ws.merge_cells(start_row=1, start_column=oc_start, end_row=1, end_column=oc_end)
+
+                ws.cell(row=1, column=1).value = "PeopleSoft"
+                ws.cell(row=1, column=oc_start).value = "Oracle Cloud"
+
+                # Row 1 styling
+                for col in range(1, ps_end + 1):
+                    c = ws.cell(row=1, column=col)
+                    c.fill = fill_header_ps
+                    c.font = font_white
+                    c.alignment = align_center
+
+                for col in range(oc_start, oc_end + 1):
+                    c = ws.cell(row=1, column=col)
+                    c.fill = fill_header_oc
+                    c.font = font_white
+                    c.alignment = align_center
+
+                # Row 2 styling
+                ws.freeze_panes = "A3"
+                for cell in ws[2]:
+                    cell.font = font_white
+                    cell.alignment = align_center
+                    cell.border = border_thin
+                    cell.fill = fill_header_ps if cell.column <= ps_end else fill_header_oc
+
+                # Fixed width = speed
+                for col in range(1, oc_end + 1):
+                    ws.column_dimensions[get_column_letter(col)].width = 20
+
             
             # --- Updated Helper: Style Sheet Header ---
             def style_sheet_header(sheet_name, fill_color):
@@ -8360,43 +8488,12 @@ async def post_validation_excel(
             style_sheet_header(sheet_discrepancies, fill_header_err)
             
             # --- Full Data Styling ---
-            if sheet_full_data in workbook.sheetnames:
-                ws = workbook[sheet_full_data]
-                ws.insert_rows(1)
-                ps_end = len(cols_to_compare)
-                oc_start = ps_end + 1
-                oc_end = ps_end + len(cols_to_compare)
-
-                ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ps_end)
-                ws.merge_cells(start_row=1, start_column=oc_start, end_row=1, end_column=oc_end)
-                ws.cell(row=1, column=1).value = "PeopleSoft"
-                ws.cell(row=1, column=oc_start).value = "Oracle Cloud"
-
-                # Header Row 1
-                for col in range(1, ps_end + 1):
-                    c = ws.cell(row=1, column=col)
-                    c.fill = fill_header_ps
-                    c.font = font_white
-                    c.alignment = align_center
-                for col in range(oc_start, oc_end + 1):
-                    c = ws.cell(row=1, column=col)
-                    c.fill = fill_header_oc
-                    c.font = font_white
-                    c.alignment = align_center
-                
-                # Header Row 2
-                ws.freeze_panes = "A3"
-                for cell in ws[2]:
-                    cell.font = font_white
-                    cell.alignment = align_center
-                    cell.border = border_thin
-                    if cell.column <= ps_end: cell.fill = fill_header_ps
-                    else: cell.fill = fill_header_oc
-                
-                # Auto-width
-                for col in ws.iter_cols(min_row=2, max_row=50):
-                    col_letter = get_column_letter(col[0].column)
-                    ws.column_dimensions[col_letter].width = 20 # Standard width for speed
+            if includeSourceTargetFiles:
+                for sheet_name in workbook.sheetnames:
+                    if sheet_name.startswith(sheet_full_data):
+                        ws = workbook[sheet_name]
+                        logger.info(f"Styling Source-Target sheet: {sheet_name}")
+                        style_full_data_header_only(ws, len(cols_to_compare))
 
             # --- Summary Styling ---
             ws_sum = workbook["Summary"]
